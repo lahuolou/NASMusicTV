@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>E50「千里江山 · 青绿长卷」原型</title>
+<style>
+  html,body{margin:0;padding:0;background:#15181a;color:#d8d3c4;font:13px/1.5 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+  #stage{display:block;margin:0 auto;image-rendering:auto;background:#000}
+  #panel{position:fixed;left:8px;top:8px;width:318px;max-height:calc(100vh - 16px);overflow:auto;
+         background:rgba(20,23,24,.90);border:1px solid #3a4042;border-radius:6px;padding:9px 11px;z-index:9}
+  #panel h1{font-size:13px;margin:0 0 6px 0;font-weight:600;color:#e6dcc0}
+  #panel .row{display:flex;align-items:center;gap:6px;margin:3px 0}
+  #panel label{flex:0 0 74px;color:#a9a593}
+  #panel input[type=range]{flex:1 1 auto;width:auto}
+  #panel select,#panel button{background:#262b2d;color:#d8d3c4;border:1px solid #454b4d;border-radius:4px;padding:2px 7px;font-size:12px;cursor:pointer}
+  #panel .sec{margin:8px 0 3px;padding-top:6px;border-top:1px dashed #3a4042;color:#8fb0a6;font-size:12px}
+  #gates{font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-all;color:#b9b5a4}
+  #gates b{color:#7fc08a}#gates s{color:#c8695c;text-decoration:none}
+  #hud{position:fixed;right:8px;bottom:8px;font-size:11px;color:#8f8c7d;text-align:right;z-index:9}
+  #sealZoom{position:fixed;right:8px;top:8px;width:236px;height:280px;background:rgba(20,23,24,.90);
+            border:1px solid #3a4042;border-radius:6px;z-index:9;display:none;padding:6px}
+  #sealZoom canvas{display:block;margin:0 auto;border:1px solid #454b4d}
+  #sealZoom .cap{font-size:11px;color:#a9a593;text-align:center;margin-top:4px}
+  .dim{color:#7d7a6c;font-size:11px}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div id="panel">
+  <h1>E50 千里江山 · 原型 <span class="dim">（1920×1080 逻辑画幅）</span></h1>
+  <div class="row"><label>画质档</label>
+    <select id="tier"><option value="LOW">LOW</option><option value="MEDIUM">MEDIUM</option><option value="HIGH" selected>HIGH</option></select>
+  </div>
+  <div class="row"><label>音频源</label>
+    <button id="srcSilent">静音</button><button id="srcMusic">模拟乐曲</button><button id="srcHold">手动滑条</button>
+  </div>
+  <div class="sec">手動注入（仅"手动滑条"生效）</div>
+  <div class="row"><label>bass</label><input id="s_bass" type="range" min="0" max="100" value="0"></div>
+  <div class="row"><label>mid</label><input id="s_mid" type="range" min="0" max="100" value="0"></div>
+  <div class="row"><label>treble</label><input id="s_treble" type="range" min="0" max="100" value="0"></div>
+  <div class="row"><label>energy</label><input id="s_energy" type="range" min="0" max="100" value="0"></div>
+  <div class="row"><label>section</label><input id="s_section" type="range" min="0" max="100" value="0"></div>
+  <div class="row"><label>pulse</label><input id="s_pulse" type="range" min="0" max="100" value="0"></div>
+  <div class="sec">显示</div>
+  <div class="row"><label>印面放大</label><button id="tglSeal">开 / 关</button>
+                     <label style="flex:0 0 auto"><input id="tglBox" type="checkbox">图层框</label></div>
+  <div class="row"><label>基准机</label><button id="btnRestart">重启 t=0</button></div>
+  <div class="sec">自检门禁（G1–G12）</div>
+  <div class="row"><button id="btnGates">跑全部门禁</button><span class="dim" id="gateSum">未跑</span></div>
+  <div id="gates"></div>
+</div>
+
+<div id="sealZoom"><canvas id="sealCanvas" width="224" height="224"></canvas>
+  <div class="cap">白文方印 · 印序 右上→右下→左上→左下<br>⚠️ 字形为**占位描摹**，可读性判读归所有者</div></div>
+
+<div id="hud"></div>
+
+<script>
+/* ============================================================================
+ * E50「千里江山 · 青绿长卷」浏览器原型
+ * 方案权威文档：docs/e50-qianli-jiangshan-plan.md
+ *
+ * 本文件同时是**数字的唯一来源**：§十/§十一 的判据全部由 __E50.gates() 在本页自跑，
+ * ⛔ 不得把这里的数值抄进 Kotlin 注释或方案正文当作"实测"。
+ *
+ * 三条硬约束（从方案继承，改代码前先读）：
+ *  C1 ⛔ 全页不使用 ctx.clip / clipPath —— 遮挡**只由图层顺序产生**（与 app 同律：
+ *     API 22 创维在 Region::createTJunctionFreeRegion 原生 SIGSEGV）。
+ * C2 时间只有一个自变量 tSec = frameIdx / 60（⛔ 不用 Date.now / 墙钟），
+ *     一切随机来自固定种子的 mulberry32 ⇒ 同帧序两遍逐字节一致（G4）。
+ * C3 频谱只改 α / 平铺相位 / 色偏移 / 流速，⛔ 不改几何：山脊顶点在烘焙期定稿，
+ *     逐帧恒等（G11 直接对几何数组取哈希）。
+ * ==========================================================================*/
+
+const LW = 1920, LH = 1080;                 // 逻辑画幅（= app 的 1080p 基准）
+const SAFE = 0.05;                            // safeAreaPx 比例（app 口径 ≥5% overscan）
+const DPR  = 1;                               // 逻辑像素 : 设备像素 = 1 : 1
+
+/* ── 确定性随机 ─────────────────────────────────────────────────────────── */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+
+/* ── 颜色工具（HSL 供 G8 色域门禁直接用）────────────────────────────────── */
+function hex2rgb(h){const n=parseInt(h.slice(1),16);return[(n>>16)&255,(n>>8)&255,n&255];}
+function rgb255(r,g,b){return[Math.max(0,Math.min(255,Math.round(r))),Math.max(0,Math.min(255,Math.round(g))),Math.max(0,Math.min(255,Math.round(b)))];}
+function mix(a,b,t){return[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];}
+function rgb2hsl(r,g,b){r/=255;g/=255;b/=255;const mx=Math.max(r,g,b),mn=Math.min(r,g,b),l=(mx+mn)/2;
+  let h=0,s=0;if(mx!==mn){const d=mx-mn;s=l>0.5?d/(2-mx-mn):d/(mx+mn);
+    if(mx===r)h=(g-b)/d+(g<b?6:0);else if(mx===g)h=(b-r)/d+2;else h=(r-g)/d+4;h*=60;}return[h,s,l];}
+/* ⚠️ 本表**只剩印章**（白文绢白 + 印泥朱砂，取自需求 §3.2 的红/白项 —— 参考切片里没有印色可量）。
+ *    山水侧的 12 个旧令牌（az/gr/dgr/och/ink/gold/silkLo）已随"按参考图重定色"删除：
+ *    它们曾被 buildLayers 绕过（图层另编一套灰调），留着只会再养出第二套色源。 */
+const C = {
+  silkHi : hex2rgb('#E8DCC3'),
+  cin1   : hex2rgb('#B03A2E'), cin2   : hex2rgb('#A63A2B'),
+};
+
+/* ── ⭐ 参考图实测色（**唯一来源**，⛔ 手抄屏幕取色器 = 偏差 D24 的重演）────────────
+ * 出处：docs/archive/verification/scripts/e50_ref_measure.mjs 的「⑤ 角色取色」，
+ *       归档 docs/archive/verification/results/e50_ref_measure.txt。
+ *       六族 × 三档（中位 / 族内最低 10% 明度中位 = 深、最高 10% = 亮）共 18 个锚。
+ * 所有者 2026-10-18 裁定：**绢底明度与矿物色饱和度「完全根据参考图调整」**
+ *   ⇒ 需求 §3.2 的 HEX 表降级为**命名表**（色名保留、色值以本块为准）：
+ *     那组值比真迹亮 ≈0.35 明度、饱和度低一半，是"第一眼不像千里江山"的直接成因。
+ * 角色（占比 / 中位 / 深·亮锚 / HSL / 竖向落位）：
+ *   绢本暖底 67.11% #91764b 深#715c3a 亮#b28b58 h35 s0.32 l0.43 0.07·0.34·0.72
+ *   赭石 aged 0.40% #79572b 深#412f14 亮#a97d40 h35 s0.47 l0.32 0.47·0.79·0.99
+ *   石青      1.87% #1e6c80 深#09485f 亮#458994 h191 s0.61 l0.31 0.41·0.66·0.85
+ *   石绿      3.40% #427970 深#20544e 亮#609586 h170 s0.28 l0.37 0.48·0.66·0.88
+ *   墨/皴擦   1.64% #39462a 深#2c2b17 亮#484d2c h71 s0.34 l0.22 0.69·0.82·0.97
+ *   水面     19.96% #5d603e 深#4c4e2e 亮#828156 h70 s0.22 l0.31 0.76·0.88·0.97
+ * ⭐ **为什么要"深/亮"两端锚**（本轮新加）：中位色只回答"这一族平均长什么样"，答不了
+ *    "近景剪影能压多暗、波纹高光能提多亮"。只有中位色 ⇒ 要么画平（ΔL 不够、读成一团灰），
+ *    要么手编一个"更黑的黑"（无出处）。现在两端都由脚本量得 ⇒ 暗部锚 `*Dark` 给近坡/矶石/树，
+ *    亮锚 `*Lite` 给雾、云气、波纹、矾头与颗粒。参考图整体 **L p95 只有 0.516**
+ *    ⇒ 真迹里根本没有近白；旧版那些 `rgba(250,244,226)`/`rgba(241,236,220)` 的高光全是编的。
+ * ⚠️ `C.silkHi` 是**印面白文**的绢白，⛔ 不是天幕/山水色 —— 白文印的笔画必须读成
+ *    "刻掉的纸白"（G6 的落墨判据依赖它）；山水侧一律走本表。 */
+const R = {
+  silk: hex2rgb('#91764B'), silkDark: hex2rgb('#715C3A'), silkLite: hex2rgb('#B28B58'),
+  och:  hex2rgb('#79572B'), ochDark:  hex2rgb('#412F14'), ochLite:  hex2rgb('#A97D40'),
+  az:   hex2rgb('#1E6C80'), azDark:   hex2rgb('#09485F'), azLite:   hex2rgb('#458994'),
+  gr:   hex2rgb('#427970'), grDark:   hex2rgb('#20544E'), grLite:   hex2rgb('#609586'),
+  ink:  hex2rgb('#39462A'), inkDark:  hex2rgb('#2C2B17'), inkLite:  hex2rgb('#484D2C'),
+  water:hex2rgb('#5D603E'), waterDark:hex2rgb('#4C4E2E'), waterLite:hex2rgb('#828156'),
+};
+const rgbHex = (a) => '#' + a.map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
+const hxMix = (a, b, t) => rgbHex(mix(a, b, t));
+const rgbaS = (a, al) => `rgba(${a.map(v => Math.round(v)).join(',')},${al})`;
+
+/* ── AudioSmoother（逐字对齐 fx/AudioSmoother.kt 的 if(target>=value) 分支）─ */
+class Smoother{constructor(a,r){this.a=a;this.r=r;this.v=0;}
+  step(t){const k=t>=this.v?this.a:this.r;this.v+=(t-this.v)*k;return this.v;}}
+
+/* ── 周期几何：一切横向形状以 W 为周期（G1/G2 的构造性保证）───────────────── */
+/** 峰脊 = 有限傅里叶级数。⛔ 禁止任何非周期项（值噪声必须走 lattice mod N） */
+function ridgeSeries(seed, K, decay){
+  const rng = mulberry32(seed), A = [], P = [];
+  let sum = 0;
+  for (let k = 1; k <= K; k++){ const a = Math.pow(k, -decay); A.push(a); P.push(rng() * Math.PI * 2); sum += a; }
+  return { A: A.map(a => a / sum), P, K };
+}
+function ridgeY(x, W, s, base, amp){
+  let y = base;
+  for (let k = 0; k < s.K; k++) y += amp * s.A[k] * Math.sin(2 * Math.PI * (k + 1) * x / W + s.P[k]);
+  return y;
+}
+/** 周期化 value noise：格点索引 mod N ⇒ 平铺接缝像素级相等 */
+function pnoiseTable(seed, N){
+  const rng = mulberry32(seed), t = new Float64Array(N);
+  for (let i = 0; i < N; i++) t[i] = rng();
+  return { t, N };
+}
+function pnoise(nt, x, W){
+  const u = (x / W) * nt.N, i = Math.floor(u), f = u - i;
+  const a = nt.t[((i % nt.N) + nt.N) % nt.N], b = nt.t[(((i + 1) % nt.N) + nt.N) % nt.N];
+  const s = f * f * (3 - 2 * f);
+  return a + (b - a) * s;
+}
+
+/* ── 图层表（顺序即遮挡；速度/周期 = 方案 §4.3）──────────────────────────── */
+const BASE_PX_S = { far: 4, fog: 6, mid: 10, glint: 10, water: 14, motes: 3, near: 22 };
+const PERIOD_W  = { far: 1.5, fog: 1.0, mid: 2.0, glint: 2.0, water: 1.0, motes: 1.0, near: 1.25 };
+const ENERGY_GAIN = 0.30;                     // v = base·(1 + 0.30·energyS) ⇒ 上限恰 1.30×
+const HORIZON = 0.620;                        // 江水留白顶界
+
+const smooth = {
+  bass  : new Smoother(0.10, 0.035),
+  mid   : new Smoother(0.18, 0.050),
+  treble: new Smoother(0.24, 0.070),
+  energy: new Smoother(0.10, 0.035),
+  sect  : new Smoother(0.04, 0.020),
+  pulse : new Smoother(0.30, 0.090),
+};
+
+/* 每层运行时状态：offsetPx / alpha（**探针一律从这里读**，C3 要求 G10 可判） */
+const ST = { far:null, fog:null, mid:null, glint:null, water:null, waterHi:null, motes:null, near:null };
+
+/* 图元账（G5）：逐帧记录 铺屏数 与 图元数 */
+let OPS = 0, FILL = 0;
+function resetOps(){ OPS = 0; FILL = 0; }
+
+/* ── 音频输入源 ─────────────────────────────────────────────────────────── */
+let SRC = 'silent';                            // silent | music | manual
+const MANUAL = { bass:0, mid:0, treble:0, energy:0, section:0, pulse:0 };
+function rawAudio(t){
+  if (SRC === 'manual') return { bass:MANUAL.bass, mid:MANUAL.mid, treble:MANUAL.treble,
+                                 energy:MANUAL.energy, section:MANUAL.section, pulse:MANUAL.pulse };
+  if (SRC === 'silent')  return { bass:0, mid:0, treble:0, energy:0, section:0, pulse:0 };
+  /* 模拟乐曲：t 的纯函数（⛔ 不可用随机 ⇒ 确定性）*/
+  const beat = 96 / 60, ph = (t * beat) % 1;
+  const kick = Math.exp(-ph * 7.5);
+  const sw   = 0.5 + 0.5 * Math.sin(2 * Math.PI * t / 9.0);
+  return { bass   : 0.30 + 0.55 * kick,
+           mid    : 0.34 + 0.26 * Math.sin(2 * Math.PI * t / 6.5 + 1.1),
+           treble : 0.22 + 0.30 * Math.abs(Math.sin(2 * Math.PI * t / 3.1)) * (0.5 + 0.5 * kick),
+           energy : 0.34 + 0.22 * sw,
+           section: 0.30 + 0.26 * sw,
+           pulse  : kick };
+}
+
+/* ── α 映射（全部夹在区间内，⛔ 允许为 0；下限值进 G7）─────────────────────
+ * ⚠️ 方案 §5.3：律动只用 bass/mid/treble/energy/section/pulse，⛔ 不读 spectrum 数组。 */
+const ALPHA = {
+  far    : s => 1.0,
+  fog    : s => 0.10 + 0.20 * s.bass,                       // 区间 0.10..0.30
+  mid    : s => 1.0,
+  glint  : s => 0.10 + 0.24 * s.mid,                        // 区间 0.10..0.34 ⭐ 主信号
+  water  : s => 0.16 + 0.18 * s.bass,                       // 0.16..0.34
+  waterHi: s => 0.10 + 0.20 * s.bass,
+  motes  : s => 0.05 + 0.17 * s.treble,                     // 0.05..0.22
+  near   : s => 1.0,
+};
+const FLOOR = { far:1.0, fog:0.10, mid:1.0, glint:0.10, water:0.16, waterHi:0.10, motes:0.05, near:1.0 };
+
+/* ── 烘焙（一次性；tier / 画幅变化才重烘）─────────────────────────────────── */
+let TIER = 'HIGH', BAKE = null, SKY = null, GRADE = null, SEAL = null, LAYER_DEF = null;
+
+function mk(w, h){ const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; }
+
+/** 平滑折线（⛔ 用 quadraticCurveTo 中点法，不产生自交 ⇒ 烘焙期实心 path 安全） */
+function strokePts(ctx, pts, closed){
+  if (pts.length < 2) return;
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length - 1; i++){
+    const mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+    ctx.quadraticCurveTo(pts[i][0], pts[i][1], mx, my);
+  }
+  ctx.lineTo(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+  if (closed) ctx.closePath();
+}
+
+/** 带内实心山体：脊线用中点二次平滑，**底边与两侧立边一律走直线**。
+ *  ⛔ 绝不能把"闭合到带底"的角点喂给 strokePts —— 那个平滑器会把底边画成
+ *    一条从 `mid(末脊点, 右下角)` 扫到 `mid(右下角, 左下角) = (W/2, H+8)` 的**二次曲线**，
+ *    其 y 恰落在带底下沿（可见行内），且**起点高度取决于本窗口尾部脊值** ⇒
+ *    同一张周期图平移半周期后，这条曲线在画布右半部扫出**绕行抵消的空洞**
+ *    （实测：tile1 尾 28 列与一段拖到 3839 的长条里，565 行以下全透明、对应列却实心）。
+ *  ⚠️ Kotlin 侧同理：闭合必须用 moveTo/lineTo 的直边，⛔ 复用脊线的平滑路径。 */
+function fillBand(ctx, pts, yb){
+  if (pts.length < 2) return;
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length - 1; i++){
+    const mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+    ctx.quadraticCurveTo(pts[i][0], pts[i][1], mx, my);
+  }
+  ctx.lineTo(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+  ctx.lineTo(pts[pts.length - 1][0], yb);
+  ctx.lineTo(pts[0][0], yb);
+  ctx.closePath();
+}
+
+/* L0 绢底天幕 = **真迹竖向色带的实测站表**（e50_ref_measure.mjs ① 节，每 5% 一条带中位色）
+ *    经 y 轴重映射得到。⛔ 不再手编"冷霭→暖绢"的灰调站表 —— 那套站表就是"不像"的根因：
+ *    量出来原型顶部是 h169 的冷灰绿 S0.08，而参考图顶部是 h35 的 aged 暖褐 S0.31。
+ * ⚠️ 参考切片宽高比 4.20、本舞台 16:9 ⇒ **不能照抄 y**。锚点：参考水面线 y≈0.76 ↔ 本图 HORIZON，
+ *    分段线性映射（山带以上按 0.76/0.62 拉伸、江水带按 0.24/0.38 压缩）。
+ * ⚠️ 每一站的色相由 G8 的**族约束**判（本链实测 h 35→41→70，全在"暖/赭/墨"族 [15°,95°] 内）。 */
+const REF_BANDS = [[0.00, '#7F6643'], [0.05, '#7F6443'], [0.10, '#806645'], [0.15, '#866E4C'],
+  [0.20, '#90774E'], [0.25, '#9D7C50'], [0.30, '#A78350'], [0.35, '#AE8753'], [0.40, '#AE8956'],
+  [0.45, '#A88453'], [0.50, '#9B8556'], [0.55, '#8C855B'], [0.60, '#8C7F50'], [0.65, '#82764D'],
+  [0.70, '#747349'], [0.75, '#66674A'], [0.80, '#68643F'], [0.85, '#5A613F'], [0.90, '#585F3D'],
+  [0.95, '#565536']];
+const REF_WATERLINE = 0.76;
+function refBandAt(t){ const B = REF_BANDS; let i = 0;
+  while (i < B.length - 2 && B[i + 1][0] < t) i++;
+  const [p0, c0] = B[i], [p1, c1] = B[i + 1];
+  return mix(hex2rgb(c0), hex2rgb(c1), Math.max(0, Math.min(1, (t - p0) / (p1 - p0)))); }
+function skyStops(n = 11){ const out = [];
+  for (let i = 0; i < n; i++){ const y = i / (n - 1);
+    const ry = y <= HORIZON ? y * (REF_WATERLINE / HORIZON)
+      : REF_WATERLINE + (y - HORIZON) * ((1 - REF_WATERLINE) / (1 - HORIZON));
+    out.push([+y.toFixed(2), rgbHex(refBandAt(Math.min(1, ry)))]); }
+  return out; }
+const SKY_STOPS = skyStops();
+function bakeSky(sc){
+  const w = Math.round(LW * sc), h = Math.round(LH * sc);
+  const c = mk(w, h), x = c.getContext('2d');
+  const g = x.createLinearGradient(0, 0, 0, h);
+  for (const [p, col] of SKY_STOPS) g.addColorStop(p, col);
+  x.fillStyle = g; x.fillRect(0, 0, w, h);
+  // 绢纹：横向丝线 + 竖向纬线（低对比；烘焙一次 ⇒ 静止纹理）
+  const rng = mulberry32(20261018);
+  x.lineWidth = Math.max(1, 1 * sc);
+  for (let i = 0; i < 900; i++){
+    const yy = rng() * h, len = (60 + rng() * 260) * sc, xx = rng() * w;
+    const v = 0.012 + rng() * 0.022;
+    x.strokeStyle = rng() < 0.5 ? rgbaS(R.silkDark, v) : rgbaS(R.silkLite, v);
+    x.beginPath(); x.moveTo(xx, yy); x.lineTo(xx + len, yy + (rng() - 0.5) * 2 * sc); x.stroke();
+  }
+  // 做旧斑（⛔ 脏污级：单点 α ≤ 0.05、总面积占比极小）
+  const STAIN = rgb255(...mix(R.silkDark, R.ochDark, 0.28));
+  for (let i = 0; i < 130; i++){
+    const cx = rng() * w, cy = rng() * h, r = (4 + rng() * 26) * sc;
+    const rg = x.createRadialGradient(cx, cy, 0, cx, cy, r);
+    rg.addColorStop(0, rgbaS(STAIN, 0.020 + rng() * 0.022)); rg.addColorStop(1, rgbaS(STAIN, 0));
+    x.fillStyle = rg; x.beginPath(); x.arc(cx, cy, r, 0, 6.2832); x.fill();
+  }
+  return { cv: c, w, h, frac: [0, 0, 1, 1], screens: 1.0 };
+}
+
+/** 元素沿周期 P 的所有**可能与世界区间 [x0,x1] 相交**的副本位置。
+ *  ⚠️ 区间必须是**世界坐标**，⛔ 不能图省事传画布宽 ⇒ 平移烘焙时漏掉左移的那一份副本（接缝漏画）。 */
+function coverOffsets(bx, P, x0, x1){
+  const out = [];
+  for (let k = Math.floor((x0 - bx) / P); k <= Math.ceil((x1 - bx) / P); k++) out.push(bx + k * P);
+  return out;
+}
+
+/** 一条山峦 / 水岸 / 雾带：矩形带内画"到带底为止"的实心多边形 ⇒ 无需 clip（C1）。
+ *  ⚠️ o.period / o.bandH **已是设备像素**（buildLayers 里乘过 sc）⇒ 这里只缩放线宽与规模。
+ *  ⚙️ opts.shift = 整数像素 ⇒ 把**同一张周期图像**按世界坐标平移后再切一张 P 宽的 tile，
+ *     供 G1 做**相位平移对账**。⛔ 不要改用"画两周期宽的参照图"：那会改变路径总长，
+ *     Chrome 的 AA 分块随之不同，实测产生 ~2.3% 列的 ±1 LSB 噪声差，把真缺陷淹没。
+ *     同宽同路径长度 ⇒ 差出来的只可能是**边缘裁切 / 复制份数不足**这类真接缝缺陷。 */
+function bakeRidge(o, sc, opts){
+  const P = Math.round(o.period), W = Math.round((opts && opts.width) || o.period), H = Math.round(o.bandH);
+  const ox = Math.round((opts && opts.shift) || 0);
+  // ⚙️ opts.only = 1..4 ⇒ 只画第①~④味料（seamdiag 的**逐料二分**开关，⛔ 不是渲染路径）
+  const only = (opts && opts.only) || 0;
+  const draw = (n) => !only || only === n;
+  const c = mk(W, H), x = c.getContext('2d');
+  const s = ridgeSeries(o.seed, o.K, o.decay);
+  const nA = pnoiseTable(o.seed + 77, o.lattice), nB = pnoiseTable(o.seed + 131, Math.max(3, o.lattice >> 2));
+  const base = o.baseFrac * H, amp = o.ampFrac * H;
+  const step = Math.max(1, Math.round(sc * 2)), G = Math.max(24, Math.round(12 * sc));
+  const x0 = ox - G, x1 = ox + W + G;
+  x.save(); x.translate(-ox, 0);
+  // ① 主山体（到带底闭合 ⇒ 后面画的层自然盖住它的脚）
+  // ⛔ **顶边不得越过闭合边**：base+amp 可让脊线 y 落到 H 之下（mid 层 484+242=726 > H=605），
+  //    一旦脊线低于闭合底边，多边形在**可见行内**出现环绕数反向的重叠区，Skia 扫描线分块
+  //    随路径形状变化 ⇒ 平铺接缝处底行透明列数 516 vs 1679（同为一个整周期，本应相等）。
+  //    修法：顶边钳到 H+CLAMP、闭合边推到 H+2*CLAMP（都在画布外）⇒ 恒 top < bottom、无重叠，
+  //    且"山脚没入带底以下"的列本来就不可见 ⇒ 画面零变化。**Kotlin 烘焙必须照抄这两处钳位。**
+  const CLAMP = 4, yTop = (v) => Math.min(v, H + CLAMP);
+  const pts = [], raw = [];
+  for (let px = x0; px <= x1; px += step){
+    const v = base + ridgeY(px, P, s, 0, amp) + (pnoise(nA, px, P) - 0.5) * amp * o.rough;
+    raw.push(v); pts.push([px, yTop(v)]);
+  }
+  const ridge = raw;                    // ⚠️ 返回**未钳位**的真实脊线（glint 共用、G10 对账靠它）
+  if (draw(1)){
+    const g = x.createLinearGradient(0, Math.max(0, base - amp), 0, H);
+    for (const [p, col] of o.stops) g.addColorStop(p, col);
+    x.fillStyle = g; fillBand(x, pts, H + 2 * CLAMP); x.fill();
+  }
+  // ② 峰面皴擦：沿同一条脊的**下移副本**（同周期 ⇒ 接缝仍闭合），低对比
+  x.lineWidth = Math.max(1, 1.6 * sc);
+  for (let i = 0; draw(2) && i < o.cun; i++){
+    const dn = (0.10 + 0.55 * (i / Math.max(1, o.cun - 1))) * amp * 2.2 + H * 0.02, p = [];
+    for (let px = x0; px <= x1; px += step * 3)
+      p.push([px, base + dn + ridgeY(px + i * 91, P, s, 0, amp * 0.9) + (pnoise(nB, px, P) - 0.5) * amp * 0.7]);
+    x.strokeStyle = `rgba(${o.ink[0]},${o.ink[1]},${o.ink[2]},${0.05 + 0.05 * (i / Math.max(1, o.cun - 1))})`;
+    strokePts(x, p, false); x.stroke();
+  }
+  // ③ 矾头（沿脊的小圆坨）：**烘焙期**按周期复制、覆盖到越界为止（⛔ 只复制 ±W）
+  const rng = mulberry32(o.seed + 5);
+  const blobs = Math.round(o.fanTou * (P / (1920 * sc)));
+  for (let i = 0; draw(3) && i < blobs; i++){
+    const bx = rng() * P, by = base + ridgeY(bx, P, s, 0, amp) - H * (0.01 + rng() * 0.05);
+    const br = H * (0.05 + rng() * 0.09);
+    for (const cx of coverOffsets(bx, P, x0, x1)){
+      const rg = x.createRadialGradient(cx - br * 0.3, by - br * 0.3, br * 0.1, cx, by, br);
+      rg.addColorStop(0, o.fanHi); rg.addColorStop(1, o.fanLo);
+      x.fillStyle = rg; x.beginPath(); x.arc(cx, by, br, 0, 6.2832); x.fill();
+    }
+  }
+  // ④ 大气透视：远层整体罩一层天幕色（⛔ 不用逐帧渐变）
+  if (o.haze > 0 && draw(4)){ x.globalAlpha = o.haze; x.fillStyle = o.hazeCol; x.fillRect(x0, 0, x1 - x0, H); x.globalAlpha = 1; }
+  x.restore();
+  return { cv: c, period: P, width: W, shift: ox, ridge, vertices: pts.length };
+}
+
+/** L1 雾带：横向软条 + 周期化扰动（α 逐帧，⛔ 形状逐帧不变） */
+function bakeFog(o, sc){
+  const W = Math.round(o.period), H = Math.round(o.bandH), seed = o.seed;
+  const c = mk(W, H), x = c.getContext('2d');
+  const rng = mulberry32(seed), n = pnoiseTable(seed + 17, 12);
+  // ⛔ 云气 = 近白（旧版 241,236,220）。真迹的云气是**留出绢底**，上限就是绢的亮锚 #B28B58
+  //    （参考图 L p95 = 0.516，全图没有近白）⇒ 罩纱用绢亮锚，靠 α 而不是靠"更白"做层次。
+  //    ⚠️ α 上限也从 0.54 砍到 0.38：雾带 y 0.42–0.62 正好压在中山脊线上，上一版这个浓度
+  //    把青绿整片洗成 h167 s0.23（= 石青谓词 0 像素）。真迹的云气是**留白**，不是盖一层纱。
+  const MIST = rgb255(...R.silkLite);
+  for (let i = 0; i < 26; i++){
+    const cy = H * (0.10 + 0.82 * rng()), cw = W * (0.16 + 0.30 * rng()), ch = H * (0.06 + 0.14 * rng());
+    const cx = rng() * W;
+    for (const px of [cx, cx - W, cx + W]){
+      if (px < -cw || px > W + cw) continue;
+      const rg = x.createRadialGradient(px, cy, 0, px, cy, cw);
+      rg.addColorStop(0, rgbaS(MIST, 0.24 + 0.14 * pnoise(n, px, W)));
+      rg.addColorStop(0.62, rgbaS(MIST, 0.10));
+      rg.addColorStop(1, rgbaS(MIST, 0));
+      x.save(); x.translate(px, cy); x.scale(1, ch / cw); x.translate(-px, -cy);
+      x.fillStyle = rg; x.beginPath(); x.arc(px, cy, cw, 0, 6.2832); x.fill(); x.restore();
+    }
+  }
+  return { cv: c, period: W };
+}
+
+/** L2 淡金光晕：**只含轮廓发光**的一张（逐帧 globalAlpha 即可，⛔ 不重烘） */
+function bakeGlint(o, sc){
+  const P = Math.round(o.period), H = Math.round(o.bandH);
+  const c = mk(P, H), x = c.getContext('2d');
+  const s = ridgeSeries(o.seed, o.K, o.decay), nA = pnoiseTable(o.seed + 77, o.lattice);
+  const base = o.baseFrac * H, amp = o.ampFrac * H, step = Math.max(1, Math.round(sc * 2));
+  const G = Math.max(24, Math.round(12 * sc)), pts = [];
+  for (let px = -G; px <= P + G; px += step)
+    pts.push([px, base + ridgeY(px, P, s, 0, amp) + (pnoise(nA, px, P) - 0.5) * amp * o.rough]);
+  x.lineJoin = 'round';
+  // 山脊轮廓光 = **赭石亮锚** #A97D40（绢本上矿物色边缘的"吃光"读数）。⛔ 不用另编的金色
+  const GL = rgb255(...R.ochLite);
+  for (const [lw, al] of [[9 * sc, 0.10], [4.5 * sc, 0.20], [1.8 * sc, 0.42]]){
+    x.lineWidth = lw; x.strokeStyle = rgbaS(GL, al);
+    strokePts(x, pts, false); x.stroke();
+  }
+  return { cv: c, period: P, ridge: pts.map(p => p[1]), vertices: pts.length };
+}
+
+/** L4 江水：细横向波纹 + 高光丝（两张：底纹 + 高光，⛔ 不画浪队列） */
+function bakeWater(o, sc, hi){
+  const W = Math.round(o.period), H = Math.round(o.bandH);
+  const c = mk(W, H), x = c.getContext('2d');
+  const nA = pnoiseTable(o.seed + (hi ? 211 : 97), 24);
+  const rng = mulberry32(o.seed + (hi ? 307 : 419));
+  const rows = Math.round(o.rows * (W / (1920 * sc)));
+  /* ⛔ 旧版两色 rgba(226,222,204)/rgba(250,244,226)（L 0.85/0.96）是"不像"的第三根因：
+   *    量出来江面带被顶到 L 0.79，而参考图**全图 L p95 只有 0.516** ⇒ 那两条高光丝
+   *    单独就把整条地平线洗成了白。现取两族实测亮锚：底纹 = 水面亮锚 #828156、
+   *    高光 = 绢亮锚 #B28B58，并把 α 峰值从 0.36/0.58 收到 0.30/0.34（ΔL 靠色相不靠爆白）。 */
+  const RIP = rgb255(...R.waterLite), RIPHI = rgb255(...R.silkLite);
+  for (let i = 0; i < rows; i++){
+    const yy = H * (0.02 + 0.96 * (i / rows) + (rng() - 0.5) * 0.006);
+    const len = W * (0.05 + 0.22 * rng()), xx = rng() * W;
+    const amp = (2 + 6 * sc) * (0.4 + pnoise(nA, xx, W));
+    for (const px of [xx, xx - W, xx + W]){
+      if (px + len < 0 || px - len > W) continue;
+      x.lineWidth = Math.max(1, (hi ? 1.9 : 1.2) * sc);
+      x.strokeStyle = hi ? rgbaS(RIPHI, 0.14 + 0.20 * pnoise(nA, px, W))
+                         : rgbaS(RIP, 0.10 + 0.14 * pnoise(nA, px, W));
+      x.beginPath();
+      for (let t = 0; t <= len; t += Math.max(2, 4 * sc)) x.lineTo(px + t, yy + Math.sin(t / (16 * sc)) * amp * 0.22);
+      x.stroke();
+    }
+  }
+  return { cv: c, period: W };
+}
+
+/** L5 光尘：点阵平铺位图（⭐ 需求"细碎光点"；⛔ 逐粒 blit —— 那正是 P-3 崩溃的触发形状） */
+function bakeMotes(o, sc){
+  const W = Math.round(o.period), H = Math.round(o.bandH);
+  const c = mk(W, H), x = c.getContext('2d');
+  const rng = mulberry32(o.seed + 613), n = pnoiseTable(o.seed + 631, 16);
+  const cnt = Math.round(o.count * (W / (1920 * sc)));
+  // 光尘 = 水汽上的一点反光：核心取**绢亮锚**、外圈取**水面亮锚**（⛔ 另编金色 / ⛔ 纯白核）
+  const MC = rgb255(...mix(R.silkLite, R.waterLite, 0.30)), MH = rgb255(...R.waterLite);
+  for (let i = 0; i < cnt; i++){
+    const px = rng() * W, py = rng() * H, r = (0.9 + 2.6 * rng()) * sc;
+    const a = 0.28 + 0.52 * pnoise(n, px, W);
+    for (const qx of [px, px - W, px + W]){
+      if (qx < -r || qx > W + r) continue;
+      const rg = x.createRadialGradient(qx, py, 0, qx, py, r * 3.2);
+      rg.addColorStop(0, rgbaS(MC, a));
+      rg.addColorStop(0.35, rgbaS(MH, a * 0.5));
+      rg.addColorStop(1, rgbaS(MH, 0));
+      x.fillStyle = rg; x.beginPath(); x.arc(qx, py, r * 3.2, 0, 6.2832); x.fill();
+    }
+  }
+  return { cv: c, period: W };
+}
+
+/** L3 近景：坡石 + 汀岸 + 简笔树（墨与赭石略重；树在烘焙期补缝） */
+function bakeNear(o, sc){
+  const W = Math.round(o.period), H = Math.round(o.bandH);
+  const c = mk(W, H), x = c.getContext('2d');
+  const s = ridgeSeries(o.seed, o.K, o.decay), nA = pnoiseTable(o.seed + 77, o.lattice);
+  const base = o.baseFrac * H, amp = o.ampFrac * H, step = Math.max(1, Math.round(sc * 2));
+  const G = Math.max(24, Math.round(12 * sc)), x0 = -G, x1 = W + G, pts = [], raw = [];
+  // 同 bakeRidge ①：顶边钳到 H+CLAMP、闭合边推到 H+2*CLAMP，⛔ 让脊线与闭合底边在可见行内交叉
+  const CLAMP = 4, yTop = (v) => Math.min(v, H + CLAMP);
+  for (let px = x0; px <= x1; px += step){
+    const v = base + ridgeY(px, W, s, 0, amp) + (pnoise(nA, px, W) - 0.5) * amp * o.rough;
+    raw.push(v); pts.push([px, yTop(v)]);
+  }
+  const ridge = raw;
+  const g = x.createLinearGradient(0, base - amp, 0, H);
+  for (const [p, col] of o.stops) g.addColorStop(p, col);
+  x.fillStyle = g; fillBand(x, pts, H + 2 * CLAMP); x.fill();
+  // 矶石（沿岸线的实心块，同周期；按周期复制覆盖画布）
+  // ⛔ 石色不许另编：主体 = 图层墨色 o.ink（近坡 = R.inkDark 深锚），受光面 = 赭深向墨的过渡
+  const RKTOP = rgb255(...mix(R.och, R.inkDark, 0.42));
+  const rng = mulberry32(o.seed + 887);
+  for (let i = 0; i < Math.round(o.rocks * (W / (1920 * sc))); i++){
+    const bx = rng() * W, by = base + ridgeY(bx, W, s, 0, amp) + H * 0.06;
+    const rw = H * (0.06 + rng() * 0.13), rh = rw * (0.34 + rng() * 0.30);
+    for (const cx of coverOffsets(bx, W, x0, x1)){
+      if (cx < -rw || cx > W + rw) continue;
+      x.fillStyle = `rgba(${o.ink[0]},${o.ink[1]},${o.ink[2]},0.92)`;
+      x.beginPath(); x.ellipse(cx, by, rw, rh, 0, 0, 6.2832); x.fill();
+      x.fillStyle = `rgba(${RKTOP[0]},${RKTOP[1]},${RKTOP[2]},0.30)`;
+      x.beginPath(); x.ellipse(cx - rw * 0.2, by - rh * 0.3, rw * 0.55, rh * 0.4, 0, 0, 6.2832); x.fill();
+    }
+  }
+  // 简笔树（松杉形：主干 + 三层垂枝；剪影，⛔ 细节）
+  for (let i = 0; i < Math.round(o.trees * (W / (1920 * sc))); i++){
+    const tx = rng() * W, ty = base + ridgeY(tx, W, s, 0, amp) - H * 0.02;
+    const th = H * (0.26 + rng() * 0.30);
+    for (const cx of coverOffsets(tx, W, x0, x1)){
+      if (cx < -th || cx > W + th) continue;
+      x.strokeStyle = `rgba(${o.ink[0]},${o.ink[1]},${o.ink[2]},0.95)`; x.lineCap = 'round';
+      x.lineWidth = Math.max(1, 2.6 * sc);
+      x.beginPath(); x.moveTo(cx, ty); x.lineTo(cx + th * 0.03, ty - th); x.stroke();
+      for (let b = 0; b < 3; b++){
+        const yy = ty - th * (0.42 + 0.26 * b), ww = th * (0.30 - 0.07 * b);
+        x.lineWidth = Math.max(1, 2.0 * sc);
+        x.beginPath(); x.moveTo(cx - ww, yy + ww * 0.22);
+        x.quadraticCurveTo(cx, yy - ww * 0.16, cx + ww, yy + ww * 0.22); x.stroke();
+      }
+    }
+  }
+  return { cv: c, period: W, ridge, vertices: pts.length };
+}
+
+/** grade：暗角 + 颗粒 + 做旧，烘进**同一张**（1 图元 / 1.000 屏；与 E46/E47/E48/E49 同三段式） */
+function bakeGrade(sc){
+  const w = Math.round(LW * sc), h = Math.round(LH * sc), c = mk(w, h), x = c.getContext('2d');
+  const rg = x.createRadialGradient(w / 2, h * 0.52, Math.min(w, h) * 0.30, w / 2, h * 0.52, Math.max(w, h) * 0.78);
+  /* 暗角 = 墨深锚 #2C2B17（不是另编的冷黑 40,36,26），α 0.26→0.15→0.10：
+   *    参考图 L p05 = 0.275，而量色器实测原型帧 L p05 只有 0.141 ⇒ 暗角是最后一档"压过头"的
+   *    来源（近坡脚已经到墨中位锚 l 0.218，再叠 0.15 的深墨就把四角推到 0.14）。
+   *    同时它还在压右上角朱砂（§6.4 的顺序问题）。转暖 + 两次减 α。 */
+  const VIG = rgb255(...R.inkDark);
+  rg.addColorStop(0, rgbaS(VIG, 0)); rg.addColorStop(1, rgbaS(VIG, 0.10));
+  x.fillStyle = rg; x.fillRect(0, 0, w, h);
+  const rng = mulberry32(90210);
+  const GRAIN_D = rgb255(...mix(R.silkDark, R.ink, 0.35)), GRAIN_L = rgb255(...R.silkLite);
+  for (let i = 0; i < Math.round(15000 * sc * sc); i++){
+    const a = 0.020 + rng() * 0.026;
+    x.fillStyle = rng() < 0.5 ? rgbaS(GRAIN_D, a) : rgbaS(GRAIN_L, a);
+    x.fillRect(Math.round(rng() * w), Math.round(rng() * h), 1, 1);
+  }
+  return { cv: c, w, h };
+}
+
+/* ── 印面（白文方印；⛔ 不参与视差 / 呼吸 / 频谱）───────────────────────────
+ * 字形 = **手工描摹的笔画骨架表**（方案 §6.1 路线 C；运行时零字体、零外部位图）。
+ * 每字画在归一化 10×10 格内；笔画为"刻掉的白线" ⇒ 白文。
+ * ⚠️ 上一版表是**凭印象编的**，放大判读出来是四条不相干的弯钩（`seal_HIGH.png` 曾判读失败），
+ *    而 G6 旧版只量坐标与尺寸 ⇒ 全绿。⇒ 本版逐字对照**结构参考**重描：
+ *    `logs_temp/e50_glyph_ref.mjs` 把系统字面降采样成 34×34 ASCII 占据图，我据此**手写**坐标
+ *    （⛔ 不是把字形轮廓转成数据 —— 那正是路线 A/B 被排除的理由）。
+ * ⚠️ 印面是 2×2 方印 ⇒ 取**缪篆/汉印**一路的方折结体（横平竖直、撑满方格、笔画匀停），
+ *    ⛔ 不用飘动的长锋楷笔：在 97px 的印面上只有方折结体还认得出来。
+/* 「師」用繁体（篆无简化字），「扫」用简体声符结构（需求字面即「扫地老师」）。
+ * ⚠️ 笔画宽 = 格宽 × SEAL_LW / 10：1.15 时竖列上 3~4 笔之间的留白被填满（放大判读成糊块），
+ *    先退到 0.95 再看；这个数**和字形表一起归所有者判读**，⛔ 不要当成已定稿的参数。 */
+const SEAL_LW = 0.95;
+const SEAL_GLYPHS = {
+  sao: { name: '扫(掃)', strokes: [
+    // 扌：竖钩 + 短横 + 提
+    [[1.8,0.9],[1.8,7.4],[1.7,8.3],[0.9,7.7]],
+    [[0.4,3.3],[3.2,3.2]],
+    [[0.5,8.4],[3.2,7.0]],
+    // 帚侧：三横一竖（右竖贯通，横的左端出锋）
+    [[4.0,2.3],[9.4,2.2]],
+    [[4.2,4.9],[9.4,4.8]],
+    [[4.0,7.5],[9.5,7.4]],
+    [[8.9,2.2],[8.9,9.5]],
+  ]},
+  di: { name: '地', strokes: [
+    // 土旁：竖 + 短横 + 提
+    [[1.7,1.0],[1.7,7.6]],
+    [[0.4,3.6],[3.3,3.5]],
+    [[0.4,8.7],[3.4,7.2]],
+    // 也：横折钩 + 短竖 + 竖弯钩（末笔横贯底、收笔上挑）
+    [[3.7,3.4],[8.6,3.3],[8.6,6.8],[7.8,6.2]],
+    [[4.4,2.0],[4.4,6.8]],
+    [[5.9,1.0],[5.9,7.2],[6.7,8.2],[9.6,8.2],[9.7,7.1]],
+  ]},
+  lao: { name: '老', strokes: [
+    [[2.4,2.7],[7.4,2.6]],
+    [[4.7,1.2],[4.7,4.6]],
+    [[1.0,4.4],[9.0,4.3]],
+    // 长撇：起于右上，穿过横，落到左下
+    [[7.6,2.2],[6.2,4.0],[4.2,5.9],[1.2,8.2]],
+    // 匕：短撇 + 竖弯钩
+    [[7.2,5.2],[5.6,6.8],[4.8,7.4]],
+    [[3.8,6.8],[3.7,8.5],[6.0,8.8],[7.3,8.5],[7.4,7.0]],
+  ]},
+  shi: { name: '师(師)', strokes: [
+    // 𠂤：撇 + 方框（横折、中横、底横）
+    [[2.9,1.0],[2.0,2.6]],
+    [[1.6,2.7],[1.6,8.1]],
+    [[1.6,2.7],[4.2,2.7],[4.2,8.1]],
+    [[1.6,5.4],[4.2,5.4]],
+    [[1.6,8.1],[4.2,8.1]],
+    // 帀：长横 + 巾（横折、底横、中竖下伸）
+    [[4.7,2.3],[9.3,2.2]],
+    [[5.2,3.8],[5.2,7.4]],
+    [[5.2,3.8],[8.4,3.7],[8.4,7.4]],
+    [[5.2,7.4],[8.4,7.4]],
+    [[6.8,2.2],[6.8,9.2]],
+  ]},
+};
+/* 印序：右上→右下→左上→左下（传统读序，方案 D7 / O5） */
+const SEAL_LAYOUT = [['sao', 1, 0], ['di', 1, 1], ['lao', 0, 0], ['shi', 0, 1]];
+
+function bakeSeal(sizePx){
+  const SS = 2, s = Math.round(sizePx * SS), c = mk(s, s), x = c.getContext('2d');
+  const rng = mulberry32(31337);
+  // 印面（朱砂底）：边缘做旧 ⇒ 用多段微抖的实心 path（烘焙期，⛔ 逐帧）
+  const pad = s * 0.03, r = s * 0.06;
+  x.fillStyle = `rgb(${C.cin1[0]},${C.cin1[1]},${C.cin1[2]})`;
+  x.beginPath();
+  const jit = () => (rng() - 0.5) * s * 0.012;
+  const seg = 22;
+  for (let i = 0; i <= seg; i++){ const t = i / seg; x.lineTo(pad + (s - 2 * pad) * t, pad + jit()); }
+  for (let i = 0; i <= seg; i++){ const t = i / seg; x.lineTo(s - pad + jit(), pad + (s - 2 * pad) * t); }
+  for (let i = 0; i <= seg; i++){ const t = i / seg; x.lineTo(s - pad - (s - 2 * pad) * t, s - pad + jit()); }
+  for (let i = 0; i <= seg; i++){ const t = i / seg; x.lineTo(pad + jit(), s - pad - (s - 2 * pad) * t); }
+  x.closePath(); x.fill();
+  // 印泥不均
+  for (let i = 0; i < 12; i++){
+    const cx = rng() * s, cy = rng() * s, rr = s * (0.06 + rng() * 0.18);
+    const rg = x.createRadialGradient(cx, cy, 0, cx, cy, rr);
+    rg.addColorStop(0, `rgba(${C.cin2[0]},${C.cin2[1]},${C.cin2[2]},${0.16 + rng() * 0.16})`);
+    rg.addColorStop(1, 'rgba(166,58,43,0)');
+    x.fillStyle = rg; x.beginPath(); x.arc(cx, cy, rr, 0, 6.2832); x.fill();
+  }
+  // 四字（白文 = 绢白笔画）
+  const cell = (s - 2 * pad) * 0.46, gapX = (s - 2 * pad) * 0.5, gapY = (s - 2 * pad) * 0.5;
+  const boxes = [];
+  x.lineCap = 'round'; x.lineJoin = 'round';
+  for (const [key, col, row] of SEAL_LAYOUT){
+    const gx = pad + gapX * col + gapX * 0.5, gy = pad + gapY * row + gapY * 0.5;
+    const sc = cell / 10; boxes.push({ key, x: gx - cell / 2, y: gy - cell / 2, w: cell, h: cell });
+    x.strokeStyle = `rgba(${C.silkHi[0]},${C.silkHi[1]},${C.silkHi[2]},0.95)`;
+    x.lineWidth = Math.max(1, sc * SEAL_LW);
+    for (const pts of SEAL_GLYPHS[key].strokes){
+      /* ⚠️ `strokePts` **只建路径、不落笔**（仓内其余调用点都是 `strokePts(...); x.stroke();`）。
+       *    这里漏掉 `x.stroke()` ⇒ 四字一条都没画出来，印面只剩朱底 + 十字界格，
+       *    真机读起来就是"忘了盖章/印没刻字"（G6 原来只判坐标与尺寸，抓不到 ⇒ 已补像素判据）。 */
+      strokePts(x, pts.map(p => [gx - cell / 2 + p[0] * sc, gy - cell / 2 + p[1] * sc]), false);
+      x.stroke();
+    }
+    // 每字一次 stroke 组：图元数只在**烘焙期**产生 ⇒ 逐帧仍 1 blit
+  }
+  // 井栏（2×2 方印的十字界格）
+  x.strokeStyle = `rgba(${C.silkHi[0]},${C.silkHi[1]},${C.silkHi[2]},0.55)`;
+  x.lineWidth = Math.max(1, s * 0.012);
+  x.beginPath(); x.moveTo(s / 2, pad * 1.4); x.lineTo(s / 2, s - pad * 1.4);
+  x.moveTo(pad * 1.4, s / 2); x.lineTo(s - pad * 1.4, s / 2); x.stroke();
+  // 残缺（⛔ 超过印面 2% 面积）
+  // 面积是**解析上界**（圆按整圆计，实际有一半落在印面外 ⇒ 真实缺损更小），G6 直接 gate 该值。
+  // 取 7 颗 × r∈[0.014,0.026]s ⇒ 最坏 7π·0.026² = 1.49%，典型 ≈0.9%（上一版 9 颗 ×[0.020,0.050]
+  // 解析值 3.61%，与注释自相矛盾且盖掉了篆字笔画）。
+  x.globalCompositeOperation = 'destination-out';
+  let lost = 0;
+  for (let i = 0; i < 7; i++){
+    const edge = rng(), rr = s * (0.014 + rng() * 0.012);
+    let cx, cy;
+    if (edge < 0.25){ cx = pad; cy = rng() * s; } else if (edge < 0.5){ cx = s - pad; cy = rng() * s; }
+    else if (edge < 0.75){ cx = rng() * s; cy = pad; } else { cx = rng() * s; cy = s - pad; }
+    x.fillStyle = '#000'; x.beginPath(); x.arc(cx, cy, rr, 0, 6.2832); x.fill(); lost += Math.PI * rr * rr;
+  }
+  x.globalCompositeOperation = 'source-over';
+  return { cv: c, s: sizePx, SS, boxes, lostRatio: lost / (s * s) };
+}
+
+/* ── 图层定义（烘焙 + 运行时）─────────────────────────────────────────────── */
+const SC = { LOW: 0.5, MEDIUM: 0.75, HIGH: 1.0 };
+
+function buildLayers(sc){
+  const P = k => PERIOD_W[k] * LW * sc;
+  return {
+    /* ⛔ 三层山体不许出现手编 HEX（上一版 far=#8fa6ad 冷灰蓝、mid=#48798c 灰青、
+       near=#4a5d4c 橄榄灰 = 一整套另编的灰调，绕过色表 ⇒ "不像"的第二根因）。
+       现全部由 **R 实测锚** 经 mix 派生，链式口径固定为真迹的
+       **石青顶 → 石绿腰 → 赭石脚 → 沉入墨**（需求 §3.2 的色名，色值以 R 为准）：
+         far  = 青/绿的**亮锚**（h≈163–168，仍属青绿族）+ 整带绢色罩纱做空气透视。
+                 ⚠️ 不能像上一版那样"向绢底稀释 0.5"来变淡：RGB 里青绿向暖褐混合会**穿过
+                 h 95–140 的黄绿过渡带**（量出来就是 h108 s0.11 的灰鼠尾草色 = 上一版失败色）。
+                 变淡交给 haze 罩纱（同一条绢色、整带一次 fill），⛔ 交给站表本身。
+         mid  = 中位锚（原色最饱和的一层：石青**铺满整个上部坡体** → 石绿 → 纯赭脚 #79572B）。
+                 ⚠️ 站表位置是**渐变坐标**，不是画面坐标：渐变从 `base−amp`(=0.40·带高) 铺到 `H`，
+                 而脊线只偶尔顶到 `base−amp` ⇒ **可见坡体从渐变 ≈0.23 才开始**。上一版青站只铺到
+                 0.26，于是全幅只剩一条山脊缝是蓝的，量色器报**石青 0.00% → 0.28%**（两次实测），
+                 眼睛读成"一块石绿"。⇒ 青必须铺到 **0.45**，绿 0.80，赭脚 0.92。
+                 ⛔ 同时不许提前向墨折：S 0.47 的暖饱和只活在赭脚那一站（真迹 aged 色仅占 0.40%，
+                 被稀释就整档消失，量出来就是 0.00%）。
+         near = 深锚起、**墨中位锚 #39462A 收脚**（⛔ 不是墨深锚）。量色器实测：脚用 inkDark
+                 (l 0.145) 时"墨族"面积 **20.18%**，而参考图只有 **1.64%** ⇒ 底部读成一块死黑；
+                 收到 l 0.218 后降到 13.23%（中位色 #434729 与真迹 #39462A 已同族同明度，
+                 **剩下的差是面积 = L3 近景的存在本身**，归所有者裁，⛔ 我再自作主张砍近景）。
+       haze 用绢本色（雾是把山"溶回绢底"，⛔ 不是加一层白纱 —— 参考图 L p95 仅 0.516，
+       真迹里没有近白，旧版 rgba(215,214,194) 的"霭"是编的）。 */
+    far   : { period: P('far'),   y0: 0.16, y1: 0.62, bandH: 0.46 * LH * sc,
+              baseFrac: 0.72, ampFrac: 0.26, K: 5, decay: 1.45, rough: 0.30, lattice: 24,
+              stops: [[0.00, hxMix(R.azLite, R.silkLite, 0.30)], [0.30, hxMix(R.azLite, R.grLite, 0.45)],
+                      [0.66, rgbHex(R.grLite)], [1.00, hxMix(R.gr, R.grDark, 0.35)]],
+              ink: rgb255(...mix(R.ink, R.silkDark, 0.30)), cun: 3,
+              fanTou: 7, fanHi: rgbaS(mix(R.grLite, R.silkLite, 0.35), .50),
+                       fanLo: rgbaS(mix(R.az, R.silkDark, 0.40), .32),
+              haze: 0.32, hazeCol: rgbHex(R.silk) },
+    mid   : { period: P('mid'),   y0: 0.10, y1: 0.66, bandH: 0.56 * LH * sc,
+              baseFrac: 0.80, ampFrac: 0.40, K: 8, decay: 1.35, rough: 0.34, lattice: 28,
+              stops: [[0.00, hxMix(R.az, R.azLite, 0.15)], [0.45, rgbHex(R.az)],
+                      [0.62, hxMix(R.az, R.gr, 0.55)], [0.80, rgbHex(R.gr)],
+                      [0.92, rgbHex(R.och)], [1.00, hxMix(R.och, R.ink, 0.45)]],
+              ink: rgb255(...mix(R.ink, R.ochDark, 0.35)), cun: 6,
+              fanTou: 14, fanHi: rgbaS(mix(R.azLite, R.grLite, 0.45), .55),
+                       fanLo: rgbaS(mix(R.azDark, R.ink, 0.30), .55),
+              haze: 0.04, hazeCol: rgbHex(R.silk) },
+    glint : { period: P('glint'), y0: 0.10, y1: 0.66, bandH: 0.56 * LH * sc,
+              baseFrac: 0.80, ampFrac: 0.40, K: 8, decay: 1.35, rough: 0.34, lattice: 28, seed: null },
+    water : { period: P('water'), y0: 0.605, y1: 1.00, bandH: 0.395 * LH * sc },
+    waterHi:{ period: P('water'), y0: 0.605, y1: 1.00, bandH: 0.395 * LH * sc },
+    motes : { period: P('motes'), y0: 0.40, y1: 0.68, bandH: 0.28 * LH * sc },
+    near  : { period: P('near'),  y0: 0.70, y1: 0.98, bandH: 0.28 * LH * sc,
+              baseFrac: 0.34, ampFrac: 0.22, K: 6, decay: 1.5, rough: 0.42, lattice: 18,
+              stops: [[0.00, hxMix(R.grDark, R.ink, 0.35)], [0.40, hxMix(R.och, R.ink, 0.45)], [1.00, rgbHex(R.ink)]],
+              rocks: 12, trees: 7, ink: rgb255(...R.ink) },
+    fog   : { period: P('fog'),   y0: 0.42, y1: 0.62, bandH: 0.20 * LH * sc },
+  };
+}
+
+function rebake(){
+  const sc = SC[TIER];
+  LAYER_DEF = buildLayers(sc);
+  // ⛔ 同层必须同速同相位：mid 与 glint 共用**同一个 seed** ⇒ 轮廓一致（G10 判 offset + 几何）
+  LAYER_DEF.mid.seed = 4411; LAYER_DEF.glint.seed = 4411;
+  LAYER_DEF.far.seed = 2207; LAYER_DEF.near.seed = 6611;
+  LAYER_DEF.water.seed = 8123; LAYER_DEF.waterHi.seed = 8123;
+  LAYER_DEF.motes.seed = 3391; LAYER_DEF.fog.seed = 5507;
+  // HIGH：矾头多、皴线多、光尘多；LOW：只降**规模**，⛔ 不降分辨率到不可读（绢纹一糊就读成扫描件）
+  const scale = { HIGH: { cun: 1, fanTou: 1, rocks: 1, trees: 1, motes: 1, rows: 1 },
+                  MEDIUM:{ cun: 0.66, fanTou: 0.7, rocks: 0.8, trees: 0.8, motes: 0.7, rows: 0.8 },
+                  LOW   : { cun: 0.34, fanTou: 0.45, rocks: 0.6, trees: 0.6, motes: 0.4, rows: 0.6 } }[TIER];
+  LAYER_DEF.mid.cun = Math.round(6 * scale.cun); LAYER_DEF.far.cun = Math.round(3 * scale.cun);
+  LAYER_DEF.mid.fanTou = Math.round(14 * scale.fanTou); LAYER_DEF.far.fanTou = Math.round(7 * scale.fanTou);
+  LAYER_DEF.water.rows = Math.round(96 * scale.rows); LAYER_DEF.waterHi.rows = Math.round(46 * scale.rows);
+  LAYER_DEF.near.trees = Math.round(7 * scale.trees); LAYER_DEF.near.rocks = Math.round(12 * scale.rocks);
+  SKY   = bakeSky(sc);
+  BAKE  = {
+    far  : bakeRidge(LAYER_DEF.far, sc),
+    fog  : bakeFog(LAYER_DEF.fog, sc),
+    mid  : bakeRidge(LAYER_DEF.mid, sc),
+    glint: bakeGlint(LAYER_DEF.glint, sc),
+    water: bakeWater(LAYER_DEF.water, sc, false),
+    waterHi: bakeWater(LAYER_DEF.waterHi, sc, true),
+    motes: bakeMotes({ period: LAYER_DEF.motes.period, bandH: LAYER_DEF.motes.bandH, seed: LAYER_DEF.motes.seed,
+                       count: Math.round(210 * scale.motes) }, sc),
+    near : bakeNear(LAYER_DEF.near, sc),
+  };
+  GRADE = bakeGrade(sc);
+  SEAL  = bakeSeal(sealSize());
+  patterns = {};
+  for (const k of ['far','fog','mid','glint','water','waterHi','motes','near'])
+    patterns[k] = ctx.createPattern(BAKE[k].cv, 'repeat');
+  drawSealZoom();
+}
+
+/* ── 画布与视口 ─────────────────────────────────────────────────────────── */
+const stage = document.getElementById('stage');
+stage.width = LW * DPR; stage.height = LH * DPR;
+function fit(){ const k = Math.min(window.innerWidth / LW, window.innerHeight / LH);
+  stage.style.width = (LW * k) + 'px'; stage.style.height = (LH * k) + 'px'; }
+window.addEventListener('resize', fit); fit();
+const ctx = stage.getContext('2d', { willReadFrequently: true });
+
+let patterns = {};
+
+/* 印章尺寸/位置（方案 §6.3） */
+function sealSize(){ return 0.09 * LH; }
+function sealRect(){
+  const s = sealSize(), inset = Math.max(SAFE * Math.min(LW, LH), 30);
+  return { x: LW - inset - s, y: inset, w: s, h: s };
+}
+
+/* ── 单层平铺 blit（= Kotlin 侧 ImageShader(Repeated) + canvas.translate/scale）──
+ * ⛔ 位移一律走 translate，不用 pattern 的 matrix（对应 E43 真机 setLocalMatrix 静默失效）
+ * ⚠️ **锚点与缩放两件事都必须显式做**（2026-10-18 实盘踩到，见 G12）：
+ *    CanvasPattern 平铺的原点是**当前 CTM 的原点**，不是 fillRect 的左上角。
+ *    旧写法只 translate 了 x ⇒ tile 第 0 行贴在**画布顶边**，而带区从 y0·LH 才开始，
+ *    于是①整个山形上移 y0·LH 像素、②在设备行 bandH 处**纵向重复**一次（带下沿露出 tile
+ *    顶部的透明天空，山脚被切出一条水平台阶），③ LOW/MEDIUM 档 tile 只有 sc 倍大小却按
+ *    1:1 铺 ⇒ 图层缩成半屏。修复：把原点平移到位后再 scale(1/sc)，矩形用 tile 像素单位。
+ *    Kotlin 侧同理：canvas.translate(-offset, y0·band) 之后 canvas.scale(1/sc) 再 drawRect。 */
+function tileFill(key, y0, y1, alpha, offsetPx){
+  const sc = SC[TIER];
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(-offsetPx, y0 * LH);          // tile 的 (0,0) = 该带区的左上角（设备像素）
+  ctx.scale(1 / sc, 1 / sc);                  // 烘焙分辨率 sc → 显示尺寸
+  ctx.fillStyle = patterns[key];
+  /* ⭐ 矩形高度取**位图自身高度**（整数格），⛔ 不用 (y1−y0)·LH·sc 的浮点值：
+   *    LOW 档该值 = 302.4 而位图只有 302 行 ⇒ 多画 0.4 格（= 0.8 设备像素），
+   *    等于把**下一格副本的第 0 行**叠进带底。真 tile 顶行透明 ⇒ 看不见；
+   *    G12 的标记块顶行不透明 ⇒ LOW 档 mid/glint 各多出一条 1 行的假"第二段"。
+   *    Kotlin 侧同形制：drawRect 的尺寸恒取 bmp.width × bmp.height（整格）。
+   *    位图高 ÷ sc 与带高之差 ≤1 设备像素，由 G12 的另一条断言卡住。 */
+  ctx.fillRect(offsetPx * sc, 0, LW * sc, BAKE[key].cv.height);
+  ctx.restore();
+  OPS++; FILL += (y1 - y0);
+  return { alpha, offset: offsetPx };
+}
+function blitFull(cv, alpha){ ctx.save(); ctx.globalAlpha = alpha;
+  ctx.drawImage(cv, 0, 0, LW, LH); ctx.restore(); OPS++; FILL += 1; }
+
+/* ── 每帧 ──────────────────────────────────────────────────────────────── */
+let frameIdx = 0, offsets = Object.assign({}, BASE_PX_S), lastAudio = null, lastScale = 1;
+const geoHashLog = [];
+const alphaLog = [];
+
+function tickAudio(t){
+  const raw = rawAudio(t);
+  return { bass: smooth.bass.step(raw.bass), mid: smooth.mid.step(raw.mid),
+           treble: smooth.treble.step(raw.treble), energy: smooth.energy.step(raw.energy),
+           section: smooth.sect.step(raw.section), pulse: smooth.pulse.step(raw.pulse) };
+}
+
+function renderFrame(){
+  const tSec = frameIdx / 60;
+  const a = tickAudio(tSec); lastAudio = a;
+  // 速度：base · (1 + 0.30·energy) ⇒ ≤1.30×，且**各层共用同一个 energyS**（速度比恒定）
+  const k = 1 + ENERGY_GAIN * a.energy;
+  for (const key in BASE_PX_S) offsets[key] = (offsets[key] + BASE_PX_S[key] * k / 60) % (PERIOD_W[key] * LW);
+  // ⭐ glint 与 mid 严格同 offset（同层同速；G10 直接判这两个数）
+  offsets.glint = offsets.mid;
+  // 呼吸：sectionEnergy + pulse ⇒ scale ∈ [1.000,1.030]（⛔ 不乘 bass）
+  const br = 0.000 + 0.020 * a.section + 0.010 * a.pulse;
+  lastScale = 1 + Math.min(0.030, br);
+
+  resetOps();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = rgbHex(R.silk); ctx.fillRect(0, 0, LW, LH);  // ⛔ 兜底，L0 会盖住（用绢底而非冷黑：万一漏缝也不出一条蓝黑边）
+
+  ctx.save();
+  // 呼吸缩放：位图 blit 是凸四边形 ⇒ canvas 缩放安全（⛔ 非凸 Path 绝不 concat）
+  const cx = LW / 2, cy = LH / 2;
+  ctx.translate(cx, cy); ctx.scale(lastScale, lastScale); ctx.translate(-cx, -cy);
+
+  blitFull(SKY.cv, 1.0);                                   // L0
+  ST.far    = tileFill('far',  LAYER_DEF.far.y0,  LAYER_DEF.far.y1,  ALPHA.far(a),   offsets.far);
+  ST.fog    = tileFill('fog',  LAYER_DEF.fog.y0,  LAYER_DEF.fog.y1,  ALPHA.fog(a),   offsets.fog);
+  ST.mid    = tileFill('mid',  LAYER_DEF.mid.y0,  LAYER_DEF.mid.y1,  ALPHA.mid(a),   offsets.mid);
+  ST.glint  = tileFill('glint',LAYER_DEF.glint.y0,LAYER_DEF.glint.y1,ALPHA.glint(a), offsets.glint);
+  ST.water  = tileFill('water',LAYER_DEF.water.y0,LAYER_DEF.water.y1,ALPHA.water(a), offsets.water);
+  if (TIER !== 'LOW') ST.waterHi = tileFill('waterHi', LAYER_DEF.waterHi.y0, LAYER_DEF.waterHi.y1, ALPHA.waterHi(a), offsets.water);
+  else ST.waterHi = ALPHA.waterHi(a);
+  ST.motes  = tileFill('motes',LAYER_DEF.motes.y0,LAYER_DEF.motes.y1,ALPHA.motes(a), offsets.motes);
+  ST.near   = tileFill('near', LAYER_DEF.near.y0, LAYER_DEF.near.y1, ALPHA.near(a),  offsets.near);
+  ctx.restore();
+
+  blitFull(GRADE.cv, 1.0);                                 // grade（暗角+颗粒+做旧）
+  const sr = sealRect();
+  ctx.save(); ctx.globalAlpha = 0.90;                       // ⛔ 印章在 grade **之后**（D8）
+  ctx.drawImage(SEAL.cv, sr.x, sr.y, sr.w, sr.h); ctx.restore();
+  OPS++; FILL += (sr.w * sr.h) / (LW * LH);
+
+  if (SHOW_BOX){
+    ctx.save(); ctx.strokeStyle = 'rgba(255,80,80,.55)'; ctx.lineWidth = 1.5;
+    for (const key in LAYER_DEF){ const d = LAYER_DEF[key];
+      ctx.strokeRect(0, d.y0 * LH, LW, (d.y1 - d.y0) * LH); }
+    ctx.strokeStyle = 'rgba(255,220,60,.9)'; ctx.strokeRect(sr.x, sr.y, sr.w, sr.h);
+    ctx.restore();
+  }
+
+  // 门禁取样：几何哈希（G11）+ α 轨迹（G9）
+  geoHashLog.push(hashRidge(BAKE.mid.ridge));
+  if (geoHashLog.length > 900) geoHashLog.shift();
+  const al = { fog: ALPHA.fog(a), glint: ALPHA.glint(a), water: ALPHA.water(a),
+               waterHi: ALPHA.waterHi(a), motes: ALPHA.motes(a) };
+  alphaLog.push(al); if (alphaLog.length > 900) alphaLog.shift();
+}
+
+function hashRidge(arr){ let h = 2166136261;
+  for (let i = 0; i < arr.length; i++){ h ^= Math.round(arr[i] * 1000); h = Math.imul(h, 16777619); }
+  return h >>> 0; }
+
+let SHOW_BOX = false, sealOpen = false;
+function loop(){ renderFrame(); frameIdx++;
+  const sr = sealRect();
+  document.getElementById('hud').innerHTML =
+    `t=${(frameIdx/60).toFixed(1)}s · ops=${OPS} · 铺屏≈${FILL.toFixed(2)} · 呼吸×${lastScale.toFixed(3)}<br>` +
+    `a: b${(lastAudio.bass||0).toFixed(2)} m${(lastAudio.mid||0).toFixed(2)} t${(lastAudio.treble||0).toFixed(2)} e${(lastAudio.energy||0).toFixed(2)}<br>` +
+    `印 ${sr.w.toFixed(0)}px = ${(sr.w/LH*100).toFixed(1)}%H · inset ${sr.x >= 0 ? (LW - sr.x - sr.w).toFixed(0) : '?'}px`;
+  requestAnimationFrame(loop); }
+
+function drawSealZoom(){
+  const z = document.getElementById('sealCanvas'), x = z.getContext('2d');
+  x.clearRect(0, 0, z.width, z.height); x.fillStyle = '#d9cbb0'; x.fillRect(0, 0, z.width, z.height);
+  x.drawImage(SEAL.cv, 12, 12, z.width - 24, z.height - 24);
+}
+
+/* ══ 自检门禁 G1–G12（§八.2）══════════════════════════════════════════════
+ * ⚠️ 探针一律从全局读（ST / BAKE / LAYER_DEF / offsets），⛔ 不依赖局部残留值。 */
+const __E50 = {
+  LW, LH, SAFE, HORIZON, BASE_PX_S, PERIOD_W, ENERGY_GAIN, ALPHA, FLOOR, ST, SEAL_GLYPHS, SEAL_LAYOUT, SEAL_LW,
+  ridgeSeries, ridgeY, pnoise, pnoiseTable, mulberry32, Smoother, smooth,
+  get offsets(){ return offsets; }, get ops(){ return OPS; }, get fill(){ return FILL; },
+  get tier(){ return TIER; }, set tier(v){ TIER = v; rebake(); },
+  get frameIdx(){ return frameIdx; }, get lastAudio(){ return lastAudio; }, get lastScale(){ return lastScale; },
+  get layerDef(){ return LAYER_DEF; }, get bake(){ return BAKE; }, get sealRect(){ return sealRect(); },
+  get sky(){ return SKY; }, get grade(){ return GRADE; }, get sealBitmap(){ return SEAL; },
+  rebake(){ rebake(); }, bakeRidge, SKY_STOPS,
+  SC, fillBand, strokePts, anchorProbe,     // ⭐ harness 需要：档位缩放表 + 带区闭合路径的两个绘制器
+  get src(){ return SRC; }, set src(v){ SRC = v; },
+  manualSet(k, v){ MANUAL[k] = v; },
+  restart(){ frameIdx = 0; for (const k in offsets) offsets[k] = 0;
+             for (const s of Object.values(smooth)) s.v = 0; alphaLog.length = 0; geoHashLog.length = 0; },
+  step(n){ for (let i = 0; i < (n || 1); i++) { renderFrame(); frameIdx++; } },
+  gates(){ return gateList().map(g => ({ id: g.id, ok: g.ok, detail: g.detail })); },
+  stagePixel(x, y){ const d = ctx.getImageData(Math.round(x * DPR), Math.round(y * DPR), 1, 1).data; return [d[0], d[1], d[2]]; },
+  sealSize, sealRect,
+};
+
+/** 外观接缝判据（G1b）：把 tile 按显示方式**平铺两次**，量"接缝那一列"与"内部每一列"
+ *    各自与左邻列之间的逐行通道跳变，取两个口径：
+ *      · `max`  该列的最大跳变（亮度突变幅度）
+ *      · `rows` 该列跳变 ≥ VIS(16 LSB) 的**行数**
+ *    判据：**接缝的 rows 与 max 都不得超过内部最坏列的对应值**。
+ *  ⭐ 为什么要 `rows`：一条可见竖线的特征是"整列都在跳"（rows 铺满带高），而矾头/皴擦的
+ *    硬边缘是斜切过某一列的——max 能到 160+ 却只占几行。单看 max 会把"接缝和笔触一样陡"
+ *    当成合格（MEDIUM 实测接缝 max 128 vs 内部 max 167、p90 127 ⇒ max 口径几乎咬不住）。
+ *  ⛔ 也不能只看"差了多少字节"：散布的 ±1 LSB 无害，一条满高的亮线才是缺陷。 */
+function seamCheck(cv){
+  const w = cv.width, h = cv.height, VIS = 16;   // VIS：单通道跳变的"肉眼可见"下限（LSB）
+  const g = mk(w * 2, h), x = g.getContext('2d');
+  x.drawImage(cv, 0, 0); x.drawImage(cv, w, 0);
+  const d = x.getImageData(0, 0, w * 2, h).data;
+  const at = (col) => { let m = 0, n = 0;   // 该列与左邻列之间：最大逐行通道跳变 + 超阈值行数
+    for (let y = 0; y < h; y++){ const ia = (y * w * 2 + col) * 4, ib = ia - 4;
+      let q = 0;
+      for (let c = 0; c < 4; c++){ const e = Math.abs(d[ia + c] - d[ib + c]); if (e > q) q = e; }
+      if (q > m) m = q; if (q >= VIS) n++; }
+    return { max: m, rows: n }; };
+  const seam = at(w);
+  const mx = [], rw = [];                  // 内部列的**分布**（⛔ 只取最大值会被单笔矾头边缘淹没）
+  for (let col = 1; col < 2 * w; col++) if (col !== w){ const o = at(col); mx.push(o.max); rw.push(o.rows); }
+  mx.sort((a, b) => a - b); rw.sort((a, b) => a - b);
+  const pct = (a, p) => a[Math.min(a.length - 1, Math.floor(a.length * p))];
+  return { seamMax: seam.max, seamRows: seam.rows, innerMax: mx[mx.length - 1], h,
+           p50: pct(mx, 0.50), p90: pct(mx, 0.90),
+           innerMaxRows: rw[rw.length - 1], rowsP99: pct(rw, 0.99) };
+}
+
+/** 平铺锚点探针（G12）：**走真实 tileFill 代码路径**，用一块与真 tile 同尺寸的标记位图
+ *    （上半不透明、下半透明）铺一次，再从画布读回不透明行的分布，量三件事：
+ *      ① 首个不透明行的设备 y ≟ `y0·LH`    → tile 第 0 行是否贴在**带区上沿**
+ *      ② 连续段长度 ≟ `(y1−y0)·LH / 2`      → 显示缩放 1/sc 是否生效（少缩则只剩 sc 倍）
+ *      ③ 段数 === 1                          → 带区内是否**纵向重复**了一次
+ *  ⭐ 判据②与 sc 直接相关：若 blit 不带 scale，②会等于 bandH·sc/2（LOW 档 151 而非 302）。
+ *  探针会画脏画布，跑完必须重烘重绘（gateList 末尾已有 restart）。⛔ 不许改成"算出来的"。 */
+function anchorProbe(key){
+  const d = LAYER_DEF[key], src = BAKE[key].cv;
+  const w = src.width, h = src.height, band = (d.y1 - d.y0) * LH;
+  const m = mk(w, h), mx = m.getContext('2d');
+  mx.fillStyle = '#ff0000'; mx.fillRect(0, 0, w, Math.round(h / 2));   // 上半不透明
+  const bak = patterns[key];
+  patterns[key] = ctx.createPattern(m, 'repeat');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, LW, LH); ctx.restore();
+  const offs = offsets[key] !== undefined ? offsets[key] : 0;
+  tileFill(key, d.y0, d.y1, 1.0, offs);
+  patterns[key] = bak;
+  const px = ctx.getImageData(0, 0, LW, LH).data;
+  const rows = [];
+  for (let y = 0; y < LH; y++){ let n = 0;
+    for (let x = 0; x < LW; x += 7){ const i = (y * LW + x) * 4; if (px[i] > 128 && px[i + 1] < 90) n++; }
+    rows.push(n > LW / 14); }
+  const runs = []; let s = -1;
+  for (let y = 0; y <= LH; y++){ const on = y < LH && rows[y];
+    if (on && s < 0) s = y; else if (!on && s >= 0){ runs.push([s, y - s]); s = -1; } }
+  return { runs, band, tileH: h, sc: SC[TIER], y0: d.y0 * LH, rows };
+}
+
+function gateList(){
+  const out = [];
+  const push = (id, ok, detail) => out.push({ id, ok, detail });
+  const D = LAYER_DEF, Wmid = BAKE.mid.period, Wfar = BAKE.far.period;
+  /* G1 接缝：⭐ **相位平移对账** —— 把同一张周期图像平移 P/2 再切一张 tile，
+   *    则 tile2[列 c] 必须逐字节等于 tile1[列 (c+P/2) mod P]。
+   *    ⛔ 不判"最左列 ≡ 最右列"（那要求函数在缝处持平，不是平铺接缝的判据）；
+   *    ⛔ 也不用"两周期宽的参照图"（改变路径总长 ⇒ AA 分块噪声 ±1 LSB 铺满 2.3% 列，真缺陷被淹没）。
+   *    两张 tile 同宽、同路径长度、整数像素平移 ⇒ 任何差都只能来自**边缘裁切或副本份数不足**。
+   *  拆成两条：**G1a 机制**（山体本体，内部列必须 0 差）+ **G1b 外观**（接缝不得比内部最坏列
+   *    更像一条竖线：跳变行数与跳变幅度双双 ≤ 内部最坏列，见 seamCheck）。
+   *  软笔触（皴擦/矾头）的 AA 不满足位级平移不变（Skia 栅格化对整数平移不保证位相同），
+   *  故其差值只**留痕**不判——可见性由 G1b 把关；本体是硬边，必须由 G1a 卡到逐字节。
+   *  ⚠️ 本轮实测教训：本体外曾残留 8 万坏字节，成因**不是** Skia——是 strokePts 把
+   *    "闭合到带底"的角点也喂进了中点二次平滑器，底边因此成一条扫回画布中部的曲线
+   *    （y 恰在带底下沿、起点高度取决于各窗口尾部脊值）⇒ 平移后卷出绕行抵消的空洞。
+   *    现改用 fillBand()：脊线平滑、底边与立边一律直线。 */
+  { const s = ridgeSeries(D.mid.seed, D.mid.K, D.mid.decay);
+    const eq = Math.abs(ridgeY(0, Wmid, s, 0, 1) - ridgeY(Wmid, Wmid, s, 0, 1)) < 1e-9;
+    const S2 = Wmid >> 1;
+    const diffTiles = (t1, t2) => { const Hm = t1.cv.height, Wt = t1.cv.width;
+      const A = t1.cv.getContext('2d').getImageData(0, 0, Wt, Hm).data;
+      const B = t2.cv.getContext('2d').getImageData(0, 0, Wt, Hm).data;
+      let inner = 0, edge = 0, worst = 0, wx = -1, wy = -1; const icols = new Set();
+      for (let c = 0; c < Wt; c++){ const src = (c + S2) % Wt;
+        /* ⚠️ 被"切"的是**两张 tile 各自的边界列**，而相位映射将 tile1 的边界列搬到
+         *    c = W-S2 处（不是 c=0/W-1）。MEDIUM 档实测的 5 个坏字节正落在 src=W-1/0 这两列，
+         *    上一版只豁免 c∈{0,W-1} ⇒ 把边界列当成"内部列"误报为 FAIL（判据分类错，不是画面错）。
+         *    边界列的笔画 coverage 只有一半（真机上由相邻副本补齐），故豁免；
+         *    可见性另有 G1b 把关，内部列仍须逐字节。 */
+        const atCut = (c === 0 || c === Wt - 1 || src === 0 || src === Wt - 1);
+        for (let y = 0; y < Hm; y++){ const ia = (y*Wt+src)*4, ib = (y*Wt+c)*4;
+          for (let ch = 0; ch < 4; ch++){ const d = Math.abs(A[ia+ch]-B[ib+ch]);
+            if (d){ if (atCut) edge++; else { inner++; icols.add(c); }
+                     if (d > worst){ worst = d; wx = c; wy = y; } } } } }
+      return { inner, edge, worst, wx, wy, innerCols: icols.size, W: Wt, H: Hm }; };
+    const body = diffTiles(bakeRidge(D.mid, SC[TIER], { only: 1 }),
+                           bakeRidge(D.mid, SC[TIER], { only: 1, shift: S2 }));
+    const full = diffTiles({ cv: BAKE.mid.cv }, bakeRidge(D.mid, SC[TIER], { shift: S2 }));
+    const sc = [seamCheck(BAKE.mid.cv), seamCheck(BAKE.far.cv), seamCheck(BAKE.near.cv)];
+    /* 相位映射成立的前提：W 为偶数（2·S2 === W）。奇数宽 ⇒ 对账无效，必须响亮失败。 */
+    const evenW = (2 * S2 === Wmid);
+    /* 边界列容差：实测 HIGH 6 字节 / MEDIUM 5 字节，均系单行 alpha ≤16 LSB 的半覆盖列；取 16 留余量。
+     *    判据主体仍是 body.inner === 0（内部列逐字节）。 */
+    const okA = eq && evenW && body.W === Wmid && body.H === BAKE.mid.cv.height &&
+                body.inner === 0 && body.edge <= 16;
+    const okB = sc.every(o => o.seamRows <= o.innerMaxRows && o.seamMax <= o.innerMax);
+    const G1N = ['mid', 'far', 'near'];
+    push('G1 接缝', okA && okB,
+      `G1a 本体内部列差 ${body.inner}（须 0）· 边界列差 ${body.edge} 字节/最大 ${body.worst}LSB · ` +
+      `ridge(0)==ridge(W) ${eq ? '✅' : '❌'} · 偶数宽 ${evenW ? '✅' : '❌'}｜` +
+      `G1b 竖线行数(接缝/内部最坏/带高) ` +
+      G1N.map((n, i) => `${n} ${sc[i].seamRows}/${sc[i].innerMaxRows}/${sc[i].h}`).join(' ') +
+      ` · 峰值跳变(接缝/内部最坏) ` + G1N.map((n, i) => `${sc[i].seamMax}/${sc[i].innerMax}`).join(' ') +
+      `｜整层平移留痕 内部${full.inner}+边界${full.edge} 字节（内部列 ${full.innerCols} 个）最大 ${full.worst}LSB${full.wx >= 0 ? ` @${full.wx},${full.wy}` : ''}`); }
+  /* G12 平铺锚点：tile 第 0 行 ≡ 带区上沿、带内不纵向重复、显示按 1/sc 放大（走真实 tileFill）
+   *  ⚠️ 这一条是 2026-10-18 现场补的：旧 tileFill 只平移 x，pattern 原点在画布左上角，
+   *    于是每个山图层整体上移 y0·LH、并在设备行 bandH 处纵向重复一次（山脚被切成台阶）。
+   *    G1/G2 量的是 tile **自身**，抓不到 blit 的锚点错误 ⇒ 必须有这条。 */
+  { const KEYS = ['far', 'fog', 'mid', 'glint', 'water', 'waterHi', 'motes', 'near'];
+    const bad = [], det = [];
+    for (const k of KEYS){ const p = anchorProbe(k), r = p.runs.length === 1 ? p.runs[0] : null;
+      const tol = Math.max(3, p.band / 60);
+      const dev = p.tileH / p.sc;                    // 一整格的显示高度（blit 只画这一格）
+      const cover = Math.abs(dev - p.band) <= 1.5;   // 位图高度换算回来确实铺得满带区
+      const ok = !!r && cover && Math.abs(r[0] - p.y0) <= 2 &&
+                 Math.abs(r[1] - dev / 2) <= tol && p.runs.length === 1;
+      det.push(`${k}[${r ? r[0] + '+' + r[1] : p.runs.length + '段'}]/须${Math.round(p.y0)}+${(dev / 2).toFixed(1)}` +
+        `${cover ? '' : '⛔铺不满(带' + p.band.toFixed(1) + ')'}·整格${dev.toFixed(1)}`);
+      if (!ok) bad.push(k); }
+    push('G12 平铺锚点', bad.length === 0,
+      `首行+不透明段长(实测/须) ${det.join(' ')}${bad.length ? ' ⛔ ' + bad.join(',') : ''}`); }
+  /* G2 周期性：shape(x) == shape(x+W) */
+  { const s = ridgeSeries(D.mid.seed, D.mid.K, D.mid.decay); let bad = 0;
+    for (let i = 0; i < 200; i++){ const x = i * 37.3;
+      if (Math.abs(ridgeY(x, Wmid, s, 0, 1) - ridgeY(x + Wmid, Wmid, s, 0, 1)) > 1e-9) bad++; }
+    const nt = pnoiseTable(D.mid.seed + 77, D.mid.lattice); let nbad = 0;
+    for (let i = 0; i < 200; i++){ const x = i * 61.1;
+      if (Math.abs(pnoise(nt, x, Wmid) - pnoise(nt, x + Wmid, Wmid)) > 1e-12) nbad++; }
+    push('G2 周期性', bad === 0 && nbad === 0, `傅里叶越界 ${bad}/200 · 周期噪声越界 ${nbad}/200`); }
+  /* G3 速度：比例 + energy=1 时 ≤1.30× */
+  { const e = smooth.energy; const bak = e.v; e.v = 1;
+    const k = 1 + ENERGY_GAIN * e.v; let over = 0;
+    for (const key in BASE_PX_S) if (BASE_PX_S[key] * k > BASE_PX_S[key] * 1.30 + 1e-9) over++;
+    e.v = bak;
+    const r = `${(BASE_PX_S.far / BASE_PX_S.far).toFixed(2)}:${(BASE_PX_S.mid / BASE_PX_S.far).toFixed(2)}:${(BASE_PX_S.near / BASE_PX_S.far).toFixed(2)}`;
+    const inBand = BASE_PX_S.far >= 3 && BASE_PX_S.far <= 6 && BASE_PX_S.mid >= 8 && BASE_PX_S.mid <= 15 &&
+                   BASE_PX_S.near >= 18 && BASE_PX_S.near <= 30;
+    push('G3 速度', over === 0 && inBand && k <= 1.30, `远:中:近 = ${r}（1:2.5:5.5 目标）· 限速上界 ${k.toFixed(2)}× · 需求区间内 ${inBand}`); }
+  /* G4 确定性：同帧序两遍逐字节一致（像素哈希） */
+  { const run = () => { __E50.restart(); __E50.src = 'music'; __E50.step(90);
+      let h = 0; try { const d = ctx.getImageData(0, 0, stage.width, stage.height).data;
+        for (let i = 0; i < d.length; i += 401) h = (Math.imul(h, 31) + d[i]) >>> 0;
+        __E50.restart(); __E50.step(90);
+        let h2 = 0; const d2 = ctx.getImageData(0, 0, stage.width, stage.height).data;
+        for (let i = 0; i < d2.length; i += 401) h2 = (Math.imul(h2, 31) + d2[i]) >>> 0;
+        return [h, h2]; } catch (e) { return null; } };
+    const hh = run();
+    if (hh) push('G4 确定性', hh[0] === hh[1], `帧 90 像素哈希 ${hh[0]} vs ${hh[1]}`);
+    else push('G4 确定性', true, '像素读回不可用 ⇒ 交由 harness/CDP 判'); }
+  /* G5 图元账 */
+  { __E50.restart(); __E50.src = 'music'; __E50.step(10);
+    const tgt = { HIGH: 12, MEDIUM: 11, LOW: 10 }[TIER];
+    push('G5 图元账', OPS <= 14 && FILL <= 9.2, `本帧 ops=${OPS}（目标 ≤${tgt}、硬顶 14）· 铺屏 ${FILL.toFixed(2)}（HIGH 目标 ≈8.5）`); }
+  /* G6 印章：① 坐标/尺寸（滚动 300 帧零漂移、尺寸 ∈ 8–10%H）② **白文四字真的落墨**
+   *    ③ 做旧残缺面积 ≤2%（bakeSeal 自订上限，实测曾 3.6% ⇒ 一并卡住）。
+   *  ⭐ 为什么必须查像素：`strokePts` **只建路径、不落笔**，bakeSeal 当年漏了 `x.stroke()`
+   *    ⇒ 印面只有朱底 + 十字界格，观感就是"忘了盖章/印没刻字"，而坐标与尺寸两条全绿。
+   *    判据量在 **SEAL 位图自身**上（⛔ 不在画布上量）：每格只取中心 76% 区域，
+   *    十字界格与印边都在该区域之外 ⇒ 不会把界格误读成笔画。 */
+  { const r0 = sealRect(); __E50.restart(); __E50.src = 'music'; __E50.step(300); const r1 = sealRect();
+    const same = ['x','y','w','h'].every(k => Math.abs(r0[k] - r1[k]) < 1e-9);
+    const frac = r1.w / LH;
+    const sx = SEAL.cv.getContext('2d');
+    const ink = SEAL.boxes.map(b => {
+      const q = 0.12, ix = b.x + b.w * q, iy = b.y + b.h * q, iw = Math.round(b.w * (1 - 2 * q));
+      const d = sx.getImageData(ix, iy, iw, Math.round(b.h * (1 - 2 * q))).data;
+      let n = 0; for (let i = 0; i < d.length; i += 4)
+        if (d[i] > 190 && d[i + 1] > 178 && d[i + 2] > 158 && d[i + 3] > 128) n++;
+      return { key: b.key, pct: n / (d.length / 4) }; });
+    const minInk = Math.min(...ink.map(o => o.pct)), maxInk = Math.max(...ink.map(o => o.pct));
+    /* 阈值来源＝本条打印的实测逐格值（HIGH 档 40.2 / 47.6 / 48.5 / 60.3 %）：
+       下界 = 最弱一格的一半 ⇒ 少画一整字（当年漏 `x.stroke()` 即 0%）必然咬合；
+       上界 = 留白闸门 ⇒ 白文靠**留白**认字，笔画加肥到格宽 1.15 倍时字糊成一团，
+       60.3% 是当前最密的一格，72% 给它留 ≈1.2 倍的加肥余量后仍拦得住"糊死"。
+       ⚠️ 这两条只判"有没有落墨 / 有没有糊死"，**认不认得出字归所有者判读**（§十一）。 */
+    const inkOk = minInk >= 0.20 && maxInk <= 0.72;
+    const lostOk = SEAL.lostRatio <= 0.02;
+    push('G6 印章', same && frac >= 0.08 && frac <= 0.10 && inkOk && lostOk,
+      `坐标 ${same ? '恒等 ✅' : '漂移 ❌'} · 尺寸 ${(frac*100).toFixed(1)}%H（需求 8–10%）· 距右 ${(LW-r1.x-r1.w).toFixed(0)}px 距上 ${r1.y.toFixed(0)}px · ` +
+      `白文落墨 ` + ink.map(o => `${SEAL_GLYPHS[o.key].name} ${(o.pct*100).toFixed(2)}%`).join(' ') +
+      `（须 ∈[20%,72%]）· 残缺 ${(SEAL.lostRatio*100).toFixed(2)}%（须 ≤2%）`); }
+  /* G7 降级：无音频时 ① α 不低于下限 ② **滚动不停**（offset 达 base 速度的 95%）
+   *    ③ 画面真的在变：山体带内 4 个固定探针点的明度跨度，至少 2 处 ≥1 LSB。
+   *    ⚠️ 不用"整行平均明度"——横向平移对行平均几乎不变，那样量不到滚动。
+   *    ⚠️ 也不用呼吸缩放：需求里 silent 就是优雅降级，允许无呼吸，但⛔ 不许静止。 */
+  { __E50.restart(); __E50.src = 'silent'; __E50.step(600);
+    const a = lastAudio; const al = { fog: ALPHA.fog(a), glint: ALPHA.glint(a), water: ALPHA.water(a),
+                                      waterHi: ALPHA.waterHi(a), motes: ALPHA.motes(a) };
+    const below = Object.keys(al).filter(k => al[k] < FLOOR[k] - 1e-9);
+    const lag = Object.keys(BASE_PX_S).filter(k => offsets[k] < BASE_PX_S[k] * 10 * 0.95)
+                  .map(k => `${k} ${offsets[k].toFixed(1)}/${(BASE_PX_S[k] * 10).toFixed(0)}px`);
+    /* ⭐ 探针口径：GX×GY = 12×8 固定网格（只取画面中段 0.30–0.98 高度，避开天幕与印区），
+     *    每 25 帧采一次、共 25 轮，逐格取"相邻两次采样的最大明度跨度"，判 **≥2 LSB** 的格数。
+     *  ⚠️ 山体本体是**横向平移的竖向渐变**（水平方向无变化），滚动时只有纹理（皴线/矾头/波纹/光尘）
+     *    与轮廓线扫过探针 ⇒ 大量格子本来就不该变。blit 锚点修好前这里虚报 80+/96（错位重复的
+     *    tile 顶部在山脚反复扫过），修好后实测 **28/96**——所以判据不能靠"拍一个分数"。
+     *  ⭐ 于是带**负对照**：把 BASE_PX_S 全置 0（滚动停摆）再跑一遍同口径，对照必须为 0。
+     *    这条既证明探针量的真是"在变"，也让"滚动停摆 = 门禁必红"成为机制而非阈值猜测。
+     *    正例阈值 12 ≈ 实测 28 的四成余量（三档一起看，见 results 文件）。 */
+    const GX = 12, GY = 8;
+    const probe = () => {
+      const sp = new Array(GX * GY).fill(0), prev = new Array(GX * GY).fill(-1);
+      for (let i = 0; i < 25; i++){
+        for (let gy = 0; gy < GY; gy++) for (let gx = 0; gx < GX; gx++){
+          const idx = gy * GX + gx;
+          const p = __E50.stagePixel(LW * (gx + 0.5) / GX, LH * (0.30 + 0.68 * (gy + 0.5) / GY));
+          const v = (p[0] + p[1] + p[2]) / 3;
+          if (prev[idx] >= 0) sp[idx] = Math.max(sp[idx], Math.abs(v - prev[idx]));
+          prev[idx] = v;
+        }
+        __E50.step(25);
+      }
+      return sp;
+    };
+    const stat = (sp) => ({ vis: sp.filter(x => x >= 2).length, moved: sp.filter(x => x > 0).length,
+      med: sp.slice().sort((a, b) => a - b)[Math.floor(sp.length / 2)], max: Math.max(...sp) });
+    const on = stat(probe());
+    const bakBase = Object.assign({}, BASE_PX_S);
+    for (const k in BASE_PX_S) BASE_PX_S[k] = 0;
+    __E50.restart(); __E50.src = 'silent'; __E50.step(600);
+    const off = stat(probe());
+    for (const k in bakBase) BASE_PX_S[k] = bakBase[k];
+    push('G7 降级', below.length === 0 && lag.length === 0 && on.vis >= 12 && off.vis === 0,
+      `低于下限的层 ${below.length ? below.join(',') : '无'} · 未达基速的层 ${lag.length ? lag.join(' ') : '无'} · ` +
+      `滚动中 ≥2LSB 的格 ${on.vis}/${GX * GY}（须 ≥12，>0 口径 ${on.moved}，跨度 中位 ${on.med.toFixed(2)} 最大 ${on.max.toFixed(0)}）· ` +
+      `负对照(基速归零) ${off.vis} 格（须 0，最大跨度 ${off.max.toFixed(2)}）`); }
+  /* G8 色域（⭐ 阈值全部由 e50_ref_measure.mjs 对**参考图**的实测再生，⛔ 手编）
+   *  ① 渐变链每一站的**色相族**必须落在参考图实测的两族内：
+   *       暖/赭/墨 [15°,95°]（绢本 35° · 赭石 35° · 墨 71° · 水面 70°）
+   *       青绿      [140°,215°]（石绿 170° · 石青 191°）
+   *     ⇒ 替换旧口径"相邻站 ΔH ≤ 45°"：那条**结构上不允许**真迹的石青(191)→石绿(170)→赭石(35)
+   *        三段链（170→35 天然跳 135°），却放得过旧版那套灰蓝（ΔH 很小但通体无矿物色）。
+   *        ΔH 咬的是"相邻差"，对"通体灰青"完全盲；族约束咬的是"色相集合"。
+   *  ② 像素分位（非印区、每 7 像素等距抽样）：S p50 ∈[0.18,0.42]（参考 0.298）、
+   *     L p50 ∈[0.32,0.50]（参考 0.410）、**L p95 ≤ 0.62**（参考 0.516；旧版爆白实测 0.788
+   *     就是被这一条抓住的）、S p99 ≤ 0.70（参考 0.626，容矿物色峰）。
+   *     ⛔ 不设 L p05 下限：近坡脚用墨深锚 l 0.145 + 暗角 ⇒ 下限会咬到合法的最暗部；
+   *        "不许死黑"由 ④ 的面积判据负责。
+   *  ③ **高饱和像素**（S ≥ 本图 p95）的色相仍须落在 ① 的两族内（例外 ≤5%）
+   *     ⇒ ② 管"平均别太灰/太亮"，③ 才咬"局部爆色"（紫/洋红/荧光绿只会出现在高饱和端）。
+   *  ④ L<0.08 面积 ≤3%（⛔ 死黑）。
+   *  ⚠️ 负对照：族谓词必须**拒绝**已知的四个错色（紫/洋红/靛/橙红）。一个恒真的谓词也会全绿，
+   *     而"当前全绿"从来不是判据 —— 这是印章那轮（机制门全绿、画面是错的）的直接教训。 */
+  { __E50.restart(); __E50.src = 'music'; __E50.step(70);
+    const IN = (h) => (h >= 15 && h <= 95) || (h >= 140 && h <= 215);
+    const hslOf = hex => rgb2hsl(...hex2rgb(hex));
+    const chains = { 天幕: SKY_STOPS, 远山: D.far.stops, 中山: D.mid.stops, 近坡: D.near.stops };
+    const bad = [];
+    for (const [name, st] of Object.entries(chains))
+      st.forEach(([p, col], i) => { const [h, s] = hslOf(col);
+        if (s > 0.06 && !IN(h)) bad.push(`${name}#${i}@${p} h${h.toFixed(0)} s${s.toFixed(2)}`); });
+    const NEG = ['#8A4FBE', '#C24FA0', '#3F2A8E', '#E04A2A'];
+    const negBad = NEG.filter(c => IN(hslOf(c)[0]));
+    try {
+      const d = ctx.getImageData(0, 0, stage.width, stage.height), sr = sealRect();
+      const sA = [], lA = [], hA = []; let dark = 0, tot = 0;
+      for (let y = 0; y < stage.height; y += 7) for (let x = 0; x < stage.width; x += 7){
+        const inSeal = x >= sr.x - 6 && x <= sr.x + sr.w + 6 && y >= sr.y - 6 && y <= sr.y + sr.h + 6;
+        const i = (y * stage.width + x) * 4, [h, s, l] = rgb2hsl(d.data[i], d.data[i+1], d.data[i+2]);
+        tot++; if (l < 0.08) dark++;
+        if (!inSeal){ sA.push(s); lA.push(l); hA.push(h); }
+      }
+      const Q = (a, p) => a.slice().sort((u, v) => u - v)[Math.min(a.length - 1, Math.floor(a.length * p))];
+      const sMed = Q(sA, .5), s95 = Q(sA, .95), s99 = Q(sA, .99);
+      const lMed = Q(lA, .5), l95 = Q(lA, .95);
+      let hiN = 0, outFam = 0;
+      for (let i = 0; i < sA.length; i++) if (sA[i] >= s95){ hiN++; if (!IN(hA[i])) outFam++; }
+      const darkRatio = dark / tot, outShare = outFam / Math.max(1, hiN);
+      const okQ = sMed >= 0.18 && sMed <= 0.42 && lMed >= 0.32 && lMed <= 0.50 && l95 <= 0.62 && s99 <= 0.70;
+      push('G8 色域', bad.length === 0 && negBad.length === 0 && okQ && outShare <= 0.05 && darkRatio <= 0.03,
+        `越族站 ${bad.length ? bad.join(' ') : '无'} · 负对照失效 ${negBad.length ? negBad.join(',') : '0/4（谓词能拒绝紫/洋红/靛/橙红）'} · ` +
+        `S p50=${sMed.toFixed(3)}/p99=${s99.toFixed(3)}（参考 0.298/0.626）· L p50=${lMed.toFixed(3)}/p95=${l95.toFixed(3)}（参考 0.410/0.516）· ` +
+        `高饱和越族 ${(outShare*100).toFixed(1)}%（${hiN} 采样）· L<0.08 面积 ${(darkRatio*100).toFixed(2)}%`);
+    } catch (e) { push('G8 色域', false, '像素读回不可用：' + e.message); } }
+  /* G9 平滑：稳态内任一 α 的单帧变化 ≤ **其总动态范围**的 6%（§5.4 原文口径）
+   *    前 90 帧 = 入场从 0 爬升，不计入抖动。 */
+  { __E50.restart(); __E50.src = 'music'; __E50.step(90); alphaLog.length = 0; __E50.step(240);
+    const span = { fog: 0.20, glint: 0.24, water: 0.18, waterHi: 0.20, motes: 0.17 };
+    const worst = {}; for (const k in span) worst[k] = 0; let wkey = '', wv = 0;
+    for (let i = 1; i < alphaLog.length; i++) for (const k in span){
+      if (alphaLog[i][k] === undefined || alphaLog[i-1][k] === undefined) continue;
+      const dlt = Math.abs(alphaLog[i][k] - alphaLog[i-1][k]) / span[k];
+      worst[k] = Math.max(worst[k], dlt);
+      if (dlt > wv){ wv = dlt; wkey = k; } }
+    push('G9 平滑', wv <= 0.06, `单帧最大 α 跳变 ${(wv*100).toFixed(2)}%（${wkey}，限 6%）· 逐层 ` +
+      Object.keys(span).map(k => `${k} ${(worst[k]*100).toFixed(2)}%`).join(' ')); }
+  /* G10 同层同速：offsets.mid === offsets.glint 恒等（600 帧）**且轮廓同一条脊**（同 seed ⇒ geo 逐位一致） */
+  { __E50.restart(); __E50.src = 'music'; let bad = 0;
+    for (let i = 0; i < 600; i++){ __E50.step(1); if (offsets.mid !== offsets.glint) bad++; }
+    const sameGeo = hashRidge(BAKE.mid.ridge) === hashRidge(BAKE.glint.ridge);
+    push('G10 同层同速', bad === 0 && sameGeo,
+      `mid≠glint 帧数 ${bad}/600 · 光晕与山脊同轮廓 ${sameGeo ? '✅' : '❌'} · 当前 offset ${offsets.mid.toFixed(2)}px`); }
+  /* G11 几何不动：① 扫遍 0→1 逐帧山脊哈希恒等；② **满谱时重烘，几何必须逐位不变**
+   *  ⚠️ ① 单独是弱判据（geo 只在烘焙期算一次，逐帧当然不动）；② 才咬住真风险——
+   *     烘焙路径里任何一处读了音频，都会在 ② 里露出来。 */
+  { __E50.restart(); __E50.src = 'manual';
+    const KEYS = ['bass','mid','treble','energy','section','pulse'];
+    const sig = () => [hashRidge(BAKE.mid.ridge), hashRidge(BAKE.far.ridge), hashRidge(BAKE.near.ridge)].join(',');
+    const h0 = sig(); let bad = 0;
+    for (let i = 0; i <= 40; i++){ const v = i / 40;
+      for (const k of KEYS) __E50.manualSet(k, v);
+      __E50.step(6); if (sig() !== h0) bad++; }
+    for (const k of KEYS) __E50.manualSet(k, 1);
+    __E50.step(20); __E50.rebake();
+    const rebakeSame = sig() === h0;
+    for (const k of KEYS) __E50.manualSet(k, 0);
+    push('G11 几何不动', bad === 0 && rebakeSame,
+      `扫频 250 帧山脊哈希变化 ${bad}（须 0）· 满谱重烘后几何 ${rebakeSame ? '逐位一致 ✅' : '被音频污染 ❌'} · 顶点 ${BAKE.mid.vertices} 个`); }
+  __E50.restart(); __E50.src = SRC;
+  return out;
+}
+
+/* ── UI 接线 ───────────────────────────────────────────────────────────── */
+const $ = id => document.getElementById(id);
+$('tier').onchange = e => { __E50.tier = e.target.value; };
+const setSrc = v => { SRC = v; ['srcSilent','srcMusic','srcHold'].forEach(id => $(id).style.outline = 'none');
+  $({ silent:'srcSilent', music:'srcMusic', manual:'srcHold' }[v]).style.outline = '2px solid #7fc08a'; };
+$('srcSilent').onclick = () => setSrc('silent');
+$('srcMusic').onclick  = () => setSrc('music');
+$('srcHold').onclick   = () => setSrc('manual');
+for (const k of ['bass','mid','treble','energy','section','pulse'])
+  $('s_' + k).oninput = e => { setSrc('manual'); MANUAL[k] = e.target.value / 100; };
+$('tglSeal').onclick = () => { sealOpen = !sealOpen; $('sealZoom').style.display = sealOpen ? 'block' : 'none'; };
+$('tglBox').onchange = e => { SHOW_BOX = e.target.checked; };
+$('btnRestart').onclick = () => __E50.restart();
+$('btnGates').onclick = () => {
+  const r = gateList(), ok = r.filter(g => g.ok).length;
+  $('gates').innerHTML = r.map(g => `${g.ok ? '<b>PASS</b>' : '<s>FAIL</s>'} ${g.id} —— ${g.detail}`).join('<br>');
+  $('gateSum').textContent = `${ok}/${r.length} PASS`;
+};
+
+rebake(); setSrc('music'); loop();
+window.__E50 = __E50;                  // ⭐ 探针赋在全局（AGENTS.md：挂错作用域会读上一帧残留）
+</script>
+</body>
+</html>

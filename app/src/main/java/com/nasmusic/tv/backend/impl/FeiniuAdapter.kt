@@ -1,0 +1,1400 @@
+package com.nasmusic.tv.backend.impl
+
+import android.content.Context
+import android.util.Base64
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.nasmusic.tv.R
+import com.nasmusic.tv.backend.BackendAdapter
+import com.nasmusic.tv.data.model.Album
+import com.nasmusic.tv.data.model.Artist
+import com.nasmusic.tv.data.model.Playlist
+import com.nasmusic.tv.data.model.ServerConfig
+import com.nasmusic.tv.data.model.Song
+import com.nasmusic.tv.data.model.SongTechnicalInfo
+import com.nasmusic.tv.data.model.VersionInfo
+import com.nasmusic.tv.util.AppLog
+import com.nasmusic.tv.util.UrlSanitizer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+
+/**
+ * 飞牛音乐（fnOS 内置音乐服务）后端适配器
+ *
+ * ## 协议依据
+ *
+ * 本实现**不再**基于第三方逆向文章的猜测，而是对齐可运行的飞牛 TV 客户端
+ * `fn-music-tv`（github.com/QiaoKes/fn-music-tv）的真实协议，详见
+ * `docs/archive/feiniu-backend-improvement-plan.md`。
+ *
+ * 要点：
+ * - API 基址：`<scheme>://<host>:<port>/music/api/v1/`（默认端口 5666 / HTTPS 5667）
+ * - 认证：`POST user/password-login`（密码 SHA-256 小写 hex）→ `data.userToken`；
+ *   后续请求用 **`Authorization: <userToken>`（原始值，无 Bearer 前缀）**
+ * - 信封：`{code, msg, data}`，`code != 0` 即失败；`data` 可能为 null
+ * - 分页：`page`（从 1 开始）+ `size`（**不是** limit/offset）
+ * - ID：全部为 **GUID 字符串**；`duration` 单位**已是毫秒**
+ * - 封面按 `static/cover?coverId=<id>&size=<px>` 取（**不是**按曲目 ID）
+ * - 播放流 `track/stream?guid=<guid>`（guid 是**查询参数**）
+ * - **访问码 / 安全码**：飞牛 NAS 可开启「外网访问码」保护，此时**账号密码正确也登不上**。
+ *   契约要求在音乐 API 之前先探测 `{origin}/access_code_verify`，并把
+ *   `x-access-code: base64(code, UTF-8)` + `x-access-source: app` 挂到
+ *   **登录、已认证 API、封面、Media3 音频**四类请求上
+ *   （`.trellis/spec/backend/android-client-contracts.md:170-173`）。
+ *   ⚠️ 探测端点挂在**站点根**，不在 `/music/api/v1/` 下 —— 见 [FeiniuUrl.accessCodeVerifyUrl]。
+ *
+ * **本适配器刻意不调用 `EncodingUtils.fixEncoding()`**，元数据字符串原样使用。
+ * 依据与理由见 [parseTrack] 上方的注释——简言之：该函数是为 Jellyfin 的
+ * 「GBK 字节被当 UTF-8 存」问题设计的，而它会**无条件剥掉结尾的 `?`**，
+ * 用在返回正常 UTF-8 的飞牛上是纯损失（"Why?" → "Why"）。
+ *
+ * Song ID 格式：`feiniu_<GUID>`，跨会话稳定。
+ */
+class FeiniuAdapter(private val appContext: Context? = null) : BackendAdapter {
+
+    companion object {
+        private const val TAG = "FeiniuAdapter"
+
+        /** Song/Album/Artist/Playlist 统一 ID 前缀 */
+        private const val ID_PREFIX = "feiniu_"
+
+        /** 翻页默认页大小 */
+        private const val DEFAULT_PAGE_SIZE = 200
+
+        /** 防御服务端 total 异常：单次翻页最多取多少页 */
+        private const val MAX_PAGES = 200
+
+        /** 曲目元数据并发上限（`getSongsByIds`） */
+        private const val METADATA_CONCURRENCY = 4
+
+        /** 超过该数量改用"全量拉取后过滤"，避免逐条请求 */
+        private const val METADATA_BATCH_THRESHOLD = 40
+
+        /** 封面请求尺寸 */
+        private const val COVER_SIZE = 512
+
+        /**
+         * ⚠️ `audioSpec.bitrate` 的单位（bps 还是 kbps）**未确认，一律填 0**。
+         *
+         * 依据：参考项目只在 `AudioSpecDto` 里声明了该字段、**全项目从未使用**，
+         * 契约文档亦未说明单位 —— 没有任何证据支持某一种解读。
+         * 而 `SongInfoPanel` 会把 `SongTechnicalInfo.bitrate` 直接渲染成 "N kbps"，
+         * 猜错就会显示 "320000 kbps" 这种一眼假的值。
+         * **宁缺勿错**：填 0 时 UI 显示 "—"。待真机抓一条已知码率的曲目确认单位后，
+         * 再改为原值（kbps）或 /1000（bps）。见开发计划 §12 待确认项。
+         */
+        private const val BITRATE_UNVERIFIED = 0
+
+        /** 搜索用的全量曲目缓存有效期 */
+        private const val TRACK_CACHE_TTL_MS = 5 * 60 * 1000L
+
+        /** deviceId 持久化键（跨进程启动保持稳定，避免服务端设备列表膨胀） */
+        private const val PREF_NAME = "feiniu_backend"
+        private const val PREF_DEVICE_ID = "device_id"
+
+        private const val PREFS_UNSET = ""
+
+        /** 访问码请求头（契约文档 §L170-L173） */
+        private const val HEADER_ACCESS_CODE = "x-access-code"
+        private const val HEADER_ACCESS_SOURCE = "x-access-source"
+
+        /** `x-access-source` 固定值 */
+        private const val ACCESS_SOURCE_APP = "app"
+
+        /**
+         * `access_code_verify` 判定为「访问码被拒」的状态码集合。
+         * 照抄参考项目 `ConnectionResolver.ACCESS_CODE_REJECTION_CODES = {401, 403, 429}`。
+         */
+        private val ACCESS_CODE_REJECTION_CODES = setOf(401, 403, 429)
+
+        /**
+         * 网络类异常类型 → 展示用短名。
+         *
+         * ⚠️ 值取**异常类简名**（`ConnectException` 等）而非中文描述：
+         * ① 类名本身就是最有诊断价值的事实（用户截图即可定位）；
+         * ② 适配器内不允许出现面向用户的中文硬编码文案——那属于 `strings.xml`。
+         */
+        private val NETWORK_ERROR_NAMES = setOf(
+            "java.net.ConnectException",
+            "java.net.UnknownHostException",
+            "java.net.SocketTimeoutException",
+            "javax.net.ssl.SSLException"
+        )
+
+        /** 异常 cause 链最大遍历深度（防病态自引用） */
+        private const val MAX_CAUSE_DEPTH = 8
+
+        /** 信封 msg 展示长度上限 */
+        private const val MAX_MSG_LENGTH = 60
+    }
+
+    /**
+     * 失败分类：[resId] 是 `R.string.*` 文案，[facts] 是原样拼在其后的协议事实。
+     *
+     * ⛔ `facts` 只允许放**非凭据**的服务端原值（HTTP 状态码 / 信封 code 与 msg /
+     * 异常类型短名），禁止放访问码、密码、token。
+     */
+    internal data class Failure(val resId: Int, val facts: List<Any> = emptyList())
+
+    override val backendType: String = ServerConfig.TYPE_FEINIU
+    override var serverName: String = "飞牛音乐"
+    override var apiVersion: String = "Unknown"
+
+    /** 归一化后的 API 基址，恒以 `/music/api/v1/` 结尾 */
+    private var apiBase: String = ""
+
+    /** 登录令牌（对应服务端 `userToken`） */
+    @Volatile
+    private var userToken: String = ""
+
+    /** 登录用户名与密码摘要，仅用于令牌失效时静默重登 */
+    @Volatile
+    private var loginUsername: String = ""
+    @Volatile
+    private var loginPasswordSha: String = ""
+
+    /**
+     * 访问码（安全码）请求头值 = `base64(code, UTF-8, NO_WRAP)`。
+     *
+     * ⚠️ **只存编码结果，不存明文**：明文仅在 `initialize()` 的栈内出现，
+     * 编码后即丢弃，明文亦不落盘（凭据由 `AppPreferences` 以 AES-GCM 加密存储）。
+     * 空串 = 用户未填访问码 ⇒ 不注入这两个头（参考项目 `ConnectionAccess.headers()` 同语义）。
+     */
+    @Volatile
+    private var encodedAccessCode: String = ""
+
+    /**
+     * 最近一次失败的分类记录（渲染 [lastErrorDetail] 的原料）；成功连接时为 null。
+     *
+     * ⚠️ 单独暴露而非只存渲染后的字符串，原因有二：
+     * 1. **可测**：本项目的单测**不打包 Android 资源**
+     *    （`app/build.gradle.kts` 未开 `unitTests.includeAndroidResources`，
+     *    Robolectric 下 `Context.getString` 恒抛 `Resources$NotFoundException`）。
+     *    只断言渲染文案的话，分类逻辑在单测里等于零覆盖——而这正是本次要修的东西。
+     * 2. **可降级**：拿不到资源表时仍能给出带协议事实的文本，而不是空串。
+     */
+    @Volatile
+    internal var lastFailure: Failure? = null
+
+    /**
+     * 最近一次失败的简短原因（见 [BackendAdapter.lastErrorDetail]）。
+     *
+     * ⛔ 渲染时只允许出现 `resId` 与**协议事实**（HTTP 状态码 / 信封 code+msg /
+     * 异常类型短名）——访问码、密码、token 一律不得进入。
+     */
+    override val lastErrorDetail: String
+        get() = lastFailure?.let { renderFailure(it) }.orEmpty()
+
+    /** 令牌代数：登录成功递增；并发重登去重用（见 [withAuthRetry]） */
+    @Volatile
+    private var tokenGeneration: Int = 0
+
+    /** 静默重登互斥：批量并发同时 401 时只真正重登一次 */
+    private val reloginMutex = Mutex()
+
+    private var serverVersion: String = ""
+    private var mediasrvVersion: String = ""
+
+    /** 曲目 ID → coverId（供 `getCoverUrl` 兜底路径使用） */
+    private val trackCoverIds = LruCache<String, String>(512)
+
+    /** 专辑 ID → coverId（供 `getCoverUrlCandidates` 使用） */
+    private val albumCoverIds = LruCache<String, String>(512)
+
+    /** 歌手 ID → coverId（供 `getCoverUrlCandidates` 使用） */
+    private val artistCoverIds = LruCache<String, String>(512)
+
+    /** 搜索用的全量曲目快照 */
+    @Volatile
+    private var allTracksCache: List<Song> = emptyList()
+    @Volatile
+    private var allTracksCacheAt: Long = 0L
+    @Volatile
+    private var allTracksCacheKey: String = ""
+
+    /**
+     * P2-8 修复（2026-09-16）：全量曲目拉取单飞锁。
+     * 缓存 miss 时并发调用（搜索 + 收藏 + getSongsByIds 各自触发）会各自跑一次
+     * `fetchAllPages` 全量翻页（最多 MAX_PAGES 页），造成重复网络风暴。
+     * 加锁后排队者拿到锁会重查缓存，只有第一个真正拉取。
+     */
+    private val allTracksRefreshMutex = Mutex()
+
+    // 安全修复（C-1）：不使用 trust-all，采用系统默认证书校验。
+
+    private val client: OkHttpClient by lazy {
+        // R-6：注入共享连接池 / Dispatcher（BackendRegistry 持有，切后端不再累积线程池）
+        OkHttpClient.Builder()
+            .dispatcher(com.nasmusic.tv.backend.BackendRegistry.sharedDispatcher)
+            .connectionPool(com.nasmusic.tv.backend.BackendRegistry.sharedConnectionPool)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * 播放流 / 封面请求需要注入的认证头。
+     *
+     * 由 `BackendRegistry` 在连接成功时将本属性绑定为 provider 给 `BackendAuthHeaders`
+     * （每次请求实时读取，静默重登换新令牌后即时生效），
+     * 再经 `BaiduHttpDataSourceFactory` 的拦截器注入 ExoPlayer 与 Coil 两条链路。
+     */
+    override val streamHeaders: Map<String, String>
+        get() = buildMap {
+            if (userToken.isNotBlank()) put("Authorization", userToken)
+            // 封面 `static/cover` 与播放流 `track/stream` 同样要过访问码
+            // （契约 §L170-L173 明列 artwork 与 Media3 audio）
+            if (encodedAccessCode.isNotEmpty()) {
+                put(HEADER_ACCESS_CODE, encodedAccessCode)
+                put(HEADER_ACCESS_SOURCE, ACCESS_SOURCE_APP)
+            }
+        }
+
+    // ==================== 认证 ====================
+
+    override suspend fun initialize(
+        baseUrl: String,
+        apiToken: String,
+        username: String,
+        password: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        lastFailure = null
+        val normalized = FeiniuUrl.normalize(baseUrl)
+        if (normalized.isBlank()) {
+            AppLog.w(TAG, "initialize: invalid baseUrl=${UrlSanitizer.sanitize(baseUrl)}")
+            lastFailure = Failure(R.string.feiniu_err_invalid_url)
+            return@withContext false
+        }
+        apiBase = normalized
+        AppLog.d(TAG, "initialize: apiBase=${UrlSanitizer.sanitize(apiBase)}")
+
+        // 先探测访问码（飞牛开启「外网访问码」时，账号密码再对也登不上）
+        probeAccessCode(apiBase)?.let { blocked ->
+            lastFailure = blocked
+            return@withContext false
+        }
+
+        // 已有令牌：直接校验
+        if (apiToken.isNotBlank()) {
+            userToken = apiToken
+            if (verifyToken()) {
+                fetchSystemConfig()
+                return@withContext true
+            }
+            AppLog.w(TAG, "initialize: saved token rejected, falling back to password login")
+            userToken = ""
+        }
+
+        // 用户名 + 密码登录
+        if (username.isNotBlank() && password.isNotBlank()) {
+            val sha = sha256Hex(password)
+            if (login(username, sha)) {
+                loginUsername = username
+                loginPasswordSha = sha
+                fetchSystemConfig()
+                return@withContext true
+            }
+        }
+        if (lastFailure == null) {
+            lastFailure = Failure(R.string.feiniu_err_no_token)
+        }
+        false
+    }
+
+    /**
+     * 探测访问码（`GET {origin}/access_code_verify`）。
+     *
+     * 判定严格照抄参考项目 `ConnectionResolver.verifyAccessCode`：
+     * - HTTP 2xx → 放行
+     * - 401/403/429 且**未填**访问码 → 需要访问码（阻塞，账号密码再对也没用）
+     * - 401/403/429 且**填了**访问码 → 访问码错误
+     * - **其他一切情况（含网络异常）→ 放行**，绝不阻塞后续登录
+     *
+     * 最后一条是照抄参考项目的 `else -> access`：老版本 fnOS 可能根本没有这个端点，
+     * 此时若阻塞就会把所有未开启访问码的用户一起挡在门外。
+     *
+     * @return `0` = 放行；非 0 = 阻塞原因的字符串资源 id（**不返回文案本身**——
+     *   文案要在渲染时才解析，避免「无 Context 解析出空串」被误当成「阻塞原因 = 空」）
+     *
+     * @return `null` = 放行；非 null = 阻塞原因（尚未渲染，由调用方写入 `lastFailure`）
+     */
+    private fun probeAccessCode(api: String): Failure? {
+        val url = FeiniuUrl.accessCodeVerifyUrl(api)
+        if (url.isBlank()) return null
+        return try {
+            val request = Request.Builder().url(url).applyAccessCodeHeaders().get().build()
+            client.newCall(request).execute().use { resp ->
+                when {
+                    resp.isSuccessful -> null
+                    resp.code in ACCESS_CODE_REJECTION_CODES && encodedAccessCode.isEmpty() -> {
+                        AppLog.w(TAG, "probeAccessCode: access code required (HTTP ${resp.code})")
+                        Failure(R.string.feiniu_err_access_code_required)
+                    }
+                    resp.code in ACCESS_CODE_REJECTION_CODES -> {
+                        AppLog.w(TAG, "probeAccessCode: HTTP ${resp.code} with access code supplied")
+                        Failure(R.string.feiniu_err_access_code_invalid)
+                    }
+                    // ⚠️ 其他状态码（含 404 = 老版本无此端点）必须放行，不能阻塞登录
+                    else -> null
+                }
+            }
+        } catch (e: Exception) {
+            // ⚠️ 网络异常同样放行（照抄参考项目语义），否则断网时连地址都验不了
+            AppLog.w(TAG, "probeAccessCode: probe failed, allowing login to continue", e)
+            null
+        }
+    }
+
+    /** 给 [Request.Builder] 挂上访问码两个头（未填访问码时不挂） */
+    private fun Request.Builder.applyAccessCodeHeaders(): Request.Builder {
+        if (encodedAccessCode.isNotEmpty()) {
+            header(HEADER_ACCESS_CODE, encodedAccessCode)
+            header(HEADER_ACCESS_SOURCE, ACCESS_SOURCE_APP)
+        }
+        return this
+    }
+
+    /**
+     * 访问码入参入口：由 `BackendRegistry` 在 `initialize()` 之前调用。
+     *
+     * 只保留 base64 结果（明文即抛，不写日志、不落盘）。该值与 `loginUsername` /
+     * `loginPasswordSha` 同生命周期——[clearSessionState] 一并清空，静默重登
+     * （[withAuthRetry]）期间仍然有效。
+     */
+    override fun setAccessCode(rawCode: String) {
+        val trimmed = rawCode.trim()
+        encodedAccessCode = if (trimmed.isEmpty()) "" else
+            Base64.encodeToString(trimmed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+    }
+
+    /**
+     * 把 [Failure] 渲染成面向用户的短文案。
+     *
+     * 正常路径：`appContext.getString(resId, *facts)` —— 文案在 `strings.xml`，协议事实
+     * 由服务端原样提供（状态码 / code / msg），二者拼在一起即可自解释。
+     *
+     * ⚠️ 降级路径（**只在单测里会走到**）：本项目单测不打包 Android 资源，
+     * `getString` 抛 `Resources$NotFoundException`。此时退化为 `[E<resId>] <facts>`，
+     * 保证 `lastErrorDetail` 永不为空、且仍保留可断言的协议事实。生产环境
+     * `BackendRegistry` 始终传入真实 Application Context，不会命中该分支。
+     */
+    private fun renderFailure(failure: Failure): String {
+        val localized = runCatching {
+            appContext?.getString(failure.resId, *failure.facts.toTypedArray())
+        }.getOrNull()
+        if (!localized.isNullOrBlank()) return localized
+        return buildString {
+            append("[E").append(failure.resId).append(']')
+            failure.facts.forEach { append(' ').append(it) }
+        }
+    }
+
+    /** 信封错误分类（code + 服务端 msg） */
+    private fun envelopeFailure(code: Int, msg: String?): Failure =
+        Failure(R.string.feiniu_err_envelope_code, listOf(code, shortenMsg(msg)))
+
+    /** 信封 msg 截断长度：服务端文案可能很长，UI 上只需可辨识的一小段 */
+    private fun shortenMsg(msg: String?): String {
+        val value = msg?.trim().orEmpty()
+        if (value.isEmpty()) return ""
+        return if (value.length <= MAX_MSG_LENGTH) value else value.take(MAX_MSG_LENGTH) + "…"
+    }
+
+    /**
+     * `POST user/password-login`
+     * Body: `{"username": ..., "password": "<sha256 hex>", "deviceId": ...}`
+     * 响应 `data.userToken` —— 注意是 **userToken**，不是 token。
+     */
+    private fun login(username: String, passwordSha: String): Boolean {
+        val body = JsonObject().apply {
+            addProperty("username", username)
+            addProperty("password", passwordSha)
+            addProperty("deviceId", deviceId())
+        }.toString()
+        val url = FeiniuUrl.endpoint(apiBase, "user/password-login")
+        return try {
+            val data = dataOf(post(url, body, authenticated = false), url) ?: return false
+            val token = str(data, "userToken")
+            if (token.isNullOrBlank()) {
+                AppLog.w(TAG, "login: response has no userToken")
+                lastFailure = Failure(R.string.feiniu_err_no_token)
+                return false
+            }
+            userToken = token
+            tokenGeneration++
+            AppLog.d(TAG, "login success, token=${token.take(8)}...")
+            true
+        } catch (e: AuthExpiredException) {
+            // 登录阶段收到令牌失效码：原因已在 dataOf 写入，直接失败
+            AppLog.w(TAG, "login: token rejected by server")
+            false
+        } catch (e: Exception) {
+            AppLog.e(TAG, "login failed", e)
+            recordNetworkError(e)
+            false
+        }
+    }
+
+    /**
+     * `GET user/me` 校验令牌是否有效。
+     *
+     * 令牌失效属**预期内**的降级路径（随后会走密码登录），因此刻意**不写**
+     * [lastErrorDetail]——否则一次正常的「旧 token 过期」会留下误导性的诊断文案。
+     */
+    private fun verifyToken(): Boolean {
+        if (userToken.isBlank() || apiBase.isBlank()) return false
+        val savedFailure = lastFailure
+        return try {
+            val url = FeiniuUrl.endpoint(apiBase, "user/me")
+            val ok = dataOf(get(url), url) != null
+            if (!ok) lastFailure = savedFailure
+            ok
+        } catch (e: Exception) {
+            AppLog.d(TAG, "verifyToken failed: ${e.message}")
+            lastFailure = savedFailure
+            false
+        }
+    }
+
+    /**
+     * `GET sys/config`（免认证）→ 服务器名与版本号
+     * 字段：`serverGUID` / `serverName` / `serverVersion` / `mediasrvVersion`
+     */
+    private fun fetchSystemConfig() {
+        try {
+            val url = FeiniuUrl.endpoint(apiBase, "sys/config")
+            val data = dataOf(get(url, authenticated = false), url) ?: return
+            str(data, "serverName")?.let { if (it.isNotBlank()) serverName = it }
+            serverVersion = str(data, "serverVersion") ?: ""
+            mediasrvVersion = str(data, "mediasrvVersion") ?: ""
+            apiVersion = serverVersion.ifBlank { "Unknown" }
+            AppLog.d(TAG, "sys/config: name=$serverName, version=$serverVersion, mediasrv=$mediasrvVersion")
+        } catch (e: Exception) {
+            AppLog.w(TAG, "sys/config failed", e)
+        }
+    }
+
+    override suspend fun getApiVersion(): VersionInfo = withContext(Dispatchers.IO) {
+        if (apiBase.isBlank()) return@withContext VersionInfo.Disconnected("飞牛音乐")
+        if (serverVersion.isBlank()) fetchSystemConfig()
+        if (serverVersion.isBlank()) {
+            VersionInfo.NoVersion("飞牛音乐")
+        } else {
+            VersionInfo.Runtime("飞牛音乐", serverVersion, "sys/config", System.currentTimeMillis())
+        }
+    }
+
+    override suspend fun testConnection(): Boolean = withContext(Dispatchers.IO) {
+        if (apiBase.isBlank()) return@withContext false
+        try {
+            // 已登录 → 校验会话；未登录 → 探测免认证的 sys/config
+            if (userToken.isNotBlank()) verifyToken()
+            else {
+                val url = FeiniuUrl.endpoint(apiBase, "sys/config")
+                dataOf(get(url, authenticated = false), url) != null
+            }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "testConnection failed", e)
+            false
+        }
+    }
+
+    override suspend fun logout() = withContext(Dispatchers.IO) {
+        if (apiBase.isNotBlank() && userToken.isNotBlank()) {
+            try {
+                val url = FeiniuUrl.endpoint(apiBase, "user/logout")
+                // 与参考项目一致：POST 空 body（无 Content-Type），而非空 JSON 串
+                val request = Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)).build()
+                execute(request, url, authenticated = true)
+            } catch (e: Exception) {
+                AppLog.w(TAG, "logout request failed", e)
+            }
+        }
+        clearSessionState()
+    }
+
+    override fun close() {
+        // R-6：连接池 / 线程池已共享（BackendRegistry 持有），此处禁止 shutdown / evictAll
+        clearSessionState()
+    }
+
+    private fun clearSessionState() {
+        userToken = ""
+        loginUsername = ""
+        loginPasswordSha = ""
+        // 访问码是凭据：与令牌同生命周期，登出即失效
+        encodedAccessCode = ""
+        apiBase = ""
+        serverVersion = ""
+        mediasrvVersion = ""
+        synchronized(trackCoverIds) { trackCoverIds.clear() }
+        synchronized(albumCoverIds) { albumCoverIds.clear() }
+        synchronized(artistCoverIds) { artistCoverIds.clear() }
+        allTracksCache = emptyList()
+        allTracksCacheAt = 0L
+        allTracksCacheKey = ""
+    }
+
+    // ==================== 专辑 ====================
+
+    /** `GET album/list?page&size&sort=newTrackAddedAt,desc` */
+    override suspend fun getAlbums(): List<Album> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages("album/list", "sort" to "newTrackAddedAt,desc") { parseAlbum(it) }
+        }.onFailure { AppLog.e(TAG, "getAlbums failed", it) }.getOrDefault(emptyList())
+    }
+
+    /** `GET track/album-detail/list?albumGUID=&sort=trackNo,asc` */
+    override suspend fun getAlbumSongs(albumId: String): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            val pages = fetchAllPagesRaw(
+                "track/album-detail/list",
+                "albumGUID" to stripPrefix(albumId),
+                "sort" to "trackNo,asc"
+            )
+            val songs = ArrayList<Song>(pages.size)
+            pages.forEachIndexed { index, obj -> parseTrack(obj, index + 1)?.let { songs.add(it) } }
+            songs
+        }.onFailure { AppLog.e(TAG, "getAlbumSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    // ==================== 歌手 ====================
+
+    /** `GET artist/list?page&size&sort=trackCount,desc` */
+    override suspend fun getArtists(): List<Artist> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages("artist/list", "sort" to "trackCount,desc") { parseArtist(it) }
+        }.onFailure { AppLog.e(TAG, "getArtists failed", it) }.getOrDefault(emptyList())
+    }
+
+    /** `GET track/artist-detail/list?artistGUID=&sort=createdAt,desc` */
+    override suspend fun getArtistSongs(artistId: String, artistName: String?): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages("track/artist-detail/list", "artistGUID" to stripPrefix(artistId), "sort" to "createdAt,desc") {
+                parseTrack(it)
+            }
+        }.onFailure { AppLog.e(TAG, "getArtistSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    // ==================== 歌曲 ====================
+
+    /** `GET track/list?page&size&sort=createdAt,desc` */
+    override suspend fun getSongs(limit: Int, offset: Int): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            // v2.39.3：每次取数前清掉上一次的失败诊断，避免「昨天连不上」的旧原因
+            // 被当成本次的错误展示给用户（成功路径不会自动清 lastFailure）。
+            lastFailure = null
+            // B14 修复沿用：limit <= 0 会除零，回退默认页大小
+            val safeLimit = if (limit > 0) limit else DEFAULT_PAGE_SIZE
+            val page = (offset / safeLimit) + 1
+            fetchAllPages("track/list", "sort" to "createdAt,desc", page = page, size = safeLimit, singlePage = true) {
+                parseTrack(it)
+            }
+        }.onFailure { AppLog.e(TAG, "getSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    override suspend fun getSongsTotalCount(): Int = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            // v2.39.3：同上，取数前清诊断
+            lastFailure = null
+            fetchTotal("track/list", "sort" to "createdAt,desc")
+        }.onFailure { AppLog.e(TAG, "getSongsTotalCount failed", it) }.getOrDefault(0)
+    }
+
+    /**
+     * 按 ID 批量取曲目。
+     *
+     * 飞牛无批量端点：少量 ID 走 `track/metadata?guid=`（并发 4），
+     * 数量大时改为一次性拉取全量曲目后过滤，避免请求风暴。
+     */
+    override suspend fun getSongsByIds(ids: List<String>): List<Song> = withContext(Dispatchers.IO) {
+        if (ids.isEmpty()) return@withContext emptyList()
+        runCatchingSuspend {
+            if (ids.size > METADATA_BATCH_THRESHOLD) {
+                val wanted = ids.map { stripPrefix(it) }.toSet()
+                return@runCatchingSuspend loadAllTracks().filter { stripPrefix(it.id) in wanted }
+            }
+            coroutineScope {
+                ids.chunked(METADATA_CONCURRENCY).flatMap { chunk ->
+                    chunk.map { id -> async { fetchTrackMetadataSong(id) } }.awaitAll().filterNotNull()
+                }
+            }
+        }.onFailure { AppLog.e(TAG, "getSongsByIds failed", it) }.getOrDefault(emptyList())
+    }
+
+    private suspend fun fetchTrackMetadataSong(id: String): Song? {
+        val raw = stripPrefix(id)
+        // 静默重登覆盖：播放解析链依赖本调用，401 时先重登再重试
+        return withAuthRetry { fetchTrackMetadataSongRaw(raw) }
+    }
+
+    private fun fetchTrackMetadataSongRaw(raw: String): Song? {
+        val url = FeiniuUrl.endpoint(apiBase, "track/metadata", "guid" to raw)
+        val data = dataOf(get(url), url) ?: return null
+        // T1（2026-10-18）：安全访问器，避免 track / audioSpec 类型不符抛异常
+        val track = data.get("track")?.takeIf { it.isJsonObject }?.asJsonObject ?: data
+        // 优先用 metadata 里的 audioSpec（列表接口返回的可能是空壳）
+        val spec = data.get("audioSpec")?.takeIf { it.isJsonObject }?.asJsonObject
+        return parseTrack(track, audioSpec = spec)
+    }
+
+    /** `GET track/list?page=1&size=N&sort=createdAt,desc` */
+    override suspend fun getRecentSongs(): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages("track/list", "sort" to "createdAt,desc", size = 100, singlePage = true) { parseTrack(it) }
+        }.onFailure { AppLog.e(TAG, "getRecentSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    /**
+     * 随机歌曲。
+     *
+     * 服务端无随机端点（`track/roam-*` 需要维护漫游会话状态，本次不引入），
+     * 改为按总数随机取一页后打乱。
+     */
+    override suspend fun getRandomSongs(limit: Int): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            val size = if (limit > 0) limit else 20
+            val total = fetchTotal("track/list", "sort" to "createdAt,desc")
+            if (total <= 0) return@runCatchingSuspend emptyList<Song>()
+            val maxPage = ((total + size - 1) / size).coerceAtLeast(1)
+            val page = (1..maxPage).random()
+            fetchAllPages("track/list", "sort" to "createdAt,desc", page = page, size = size, singlePage = true) {
+                parseTrack(it)
+            }.shuffled().take(size)
+        }.onFailure { AppLog.e(TAG, "getRandomSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    /**
+     * 搜索歌曲。
+     *
+     * ⚠️ 飞牛服务端**没有搜索端点**（参考项目 `TrimMusicApi` 全文无 search），
+     * 因此改为客户端本地过滤：拉取全量曲目快照（5 分钟缓存）后按
+     * 标题 / 艺术家 / 专辑做大小写不敏感匹配。
+     */
+    override suspend fun searchSongs(query: String): List<Song> = withContext(Dispatchers.IO) {
+        val keyword = query.trim()
+        if (keyword.isBlank()) return@withContext emptyList()
+        runCatchingSuspend {
+            val lower = keyword.lowercase()
+            loadAllTracks().mapNotNull { song ->
+                val title = song.title.lowercase()
+                val artist = song.artist.lowercase()
+                val album = song.album.lowercase()
+                val score = when {
+                    title.startsWith(lower) -> 0
+                    artist.startsWith(lower) -> 1
+                    album.startsWith(lower) -> 2
+                    title.contains(lower) -> 3
+                    artist.contains(lower) -> 4
+                    album.contains(lower) -> 5
+                    else -> return@mapNotNull null
+                }
+                score to song
+            }.sortedWith(compareBy({ it.first }, { it.second.title.length })).map { it.second }
+        }.onFailure { AppLog.e(TAG, "searchSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    /** 全量曲目快照（带 TTL 缓存，仅用于搜索 / 批量查询） */
+    private suspend fun loadAllTracks(): List<Song> {
+        val key = apiBase
+        val now = System.currentTimeMillis()
+        if (allTracksCache.isNotEmpty() &&
+            allTracksCacheKey == key &&
+            now - allTracksCacheAt < TRACK_CACHE_TTL_MS
+        ) {
+            return allTracksCache
+        }
+        // P2-8 修复（2026-09-16）：单飞——并发 miss 时只有一个真正全量拉取。
+        // 拿到锁后必须**重查缓存**：排队期间前一个调用可能已填充缓存（含 TTL 判定），
+        // 否则单飞退化为串行 N 次全量拉取。
+        return allTracksRefreshMutex.withLock {
+            val lockedAt = System.currentTimeMillis()
+            if (allTracksCache.isNotEmpty() &&
+                allTracksCacheKey == key &&
+                lockedAt - allTracksCacheAt < TRACK_CACHE_TTL_MS
+            ) {
+                return@withLock allTracksCache
+            }
+            val fresh = fetchAllPages("track/list", "sort" to "createdAt,desc") { parseTrack(it) }
+            allTracksCache = fresh
+            allTracksCacheAt = lockedAt
+            allTracksCacheKey = key
+            fresh
+        }
+    }
+
+    // ==================== 流 / 封面 / 歌词 / 技术信息 ====================
+
+    /** `GET track/stream?guid=<guid>` */
+    override fun getStreamUrl(songId: String): String =
+        FeiniuUrl.streamUrl(apiBase, stripPrefix(songId))
+
+    /**
+     * 兜底封面地址（`static/cover?coverId=<id>&size=`）。
+     *
+     * ⚠️ 一、UI 主路径并不走这里（全仓库无调用者），而是 `Song.coverUrl`
+     * 与 [getCoverUrlCandidates]；本方法仅保持接口契约完整。
+     *
+     * ⚠️ 二、本方法**只查内存缓存，不发网络请求**：它是非 suspend 的，
+     * 调用方线程不可控（可能在主线程），缓存未命中时返回空串由 UI 降级占位图。
+     * 需要精确封面请用 suspend 的 `getSongsByIds` / `getSongTechnicalInfo` 补齐缓存。
+     */
+    override fun getCoverUrl(songId: String): String {
+        val raw = stripPrefix(songId)
+        val cached = synchronized(trackCoverIds) { trackCoverIds[raw] }
+        return FeiniuUrl.coverUrl(apiBase, cached, COVER_SIZE) ?: ""
+    }
+
+    /**
+     * 封面候选列表：`歌曲封面 → 专辑封面 → 歌手封面`。
+     *
+     * 这是 UI **唯一**使用的封面入口（`MainViewModel`），必须包含 `song.coverUrl`，
+     * 否则主路径封面全丢。
+     */
+    override fun getCoverUrlCandidates(song: Song): List<String> {
+        val urls = LinkedHashSet<String>()
+        song.coverUrl?.takeIf { it.isNotBlank() }?.let { urls.add(it) }
+        val albumCover = song.albumId?.let { synchronized(albumCoverIds) { albumCoverIds[stripPrefix(it)] } }
+        FeiniuUrl.coverUrl(apiBase, albumCover, COVER_SIZE)?.let { urls.add(it) }
+        val artistCover = song.artistId?.let { synchronized(artistCoverIds) { artistCoverIds[stripPrefix(it)] } }
+        FeiniuUrl.coverUrl(apiBase, artistCover, COVER_SIZE)?.let { urls.add(it) }
+        return urls.toList()
+    }
+
+    /**
+     * `GET lyric/list?trackGUID=<guid>`
+     *
+     * 返回 `{list:[{guid,content,isLRC,offset}], preferred}`：
+     * 优先取 `preferred` 指定的条目，否则取第一条 `isLRC == true` 的，再否则取第一条。
+     * `offset` 非零时前置 `[offset:<ms>]` 行 —— `LrcParser` 会解析该头部。
+     */
+    override suspend fun getLyrics(songId: String): String? = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            // 静默重登覆盖：歌词加载不再因令牌过期静默失败
+            withAuthRetry { fetchLyricsRaw(stripPrefix(songId)) }
+        }.onFailure { AppLog.e(TAG, "getLyrics failed", it) }.getOrNull()
+    }
+
+    private fun fetchLyricsRaw(trackGuid: String): String? {
+        val url = FeiniuUrl.endpoint(apiBase, "lyric/list", "trackGUID" to trackGuid)
+        val data = dataOf(get(url), url) ?: return null
+        val list = data.get("list")?.takeIf { it.isJsonArray }?.asJsonArray ?: return null
+        if (list.isEmpty) return null
+        val preferred = str(data, "preferred")
+
+        var chosen: JsonObject? = null
+        var fallback: JsonObject? = null
+        for (element in list) {
+            val obj = element as? JsonObject ?: continue
+            if (fallback == null) fallback = obj
+            if (preferred != null && str(obj, "guid") == preferred) {
+                chosen = obj
+                break
+            }
+            if (chosen == null && obj.get("isLRC")?.asBoolean == true) chosen = obj
+        }
+        val target = chosen ?: fallback ?: return null
+        val content = str(target, "content")?.takeIf { it.isNotBlank() } ?: return null
+        val offset = longOf(target.get("offset")) ?: 0L
+        return if (offset != 0L) "[offset:$offset]\n$content" else content
+    }
+
+    /** `GET track/metadata?guid=` → `audioSpec`（codec / container / bitrate / duration） */
+    override suspend fun getSongTechnicalInfo(songId: String): SongTechnicalInfo? = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            // 静默重登覆盖：技术信息面板不再因令牌过期静默空白
+            withAuthRetry { fetchTechInfoRaw(stripPrefix(songId)) }
+        }.onFailure { AppLog.e(TAG, "getSongTechnicalInfo failed", it) }.getOrNull()
+    }
+
+    private fun fetchTechInfoRaw(guid: String): SongTechnicalInfo? {
+        val url = FeiniuUrl.endpoint(apiBase, "track/metadata", "guid" to guid)
+        val data = dataOf(get(url), url) ?: return null
+        // T1（2026-10-18）：安全访问器，避免 audioSpec 类型不符时抛异常
+        val spec = data.get("audioSpec")?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
+        val container = str(spec, "container").orEmpty()
+        val codec = str(spec, "codec").orEmpty()
+        val rawBitrate = longOf(spec.get("bitrate")) ?: 0L
+        if (rawBitrate != 0L) {
+            AppLog.d(TAG, "track/metadata: raw bitrate=$rawBitrate (单位未确认，暂不展示)")
+        }
+        return SongTechnicalInfo(
+            codec = codec.uppercase(),
+            bitrate = BITRATE_UNVERIFIED,
+            // ⚠️ 飞牛 audioSpec 不含采样率与声道数，未知字段填 0，不要臆造
+            sampleRate = 0,
+            channels = 0,
+            fileSize = 0L,
+            durationMs = parseDurationMs(spec.get("duration")) ?: 0L,
+            format = container.ifBlank { codec }.uppercase()
+        )
+    }
+
+    // ==================== 歌单 ====================
+
+    /** `GET playlist/list`（列表不返回曲目数，需逐个 `playlist/detail` 补） */
+    override suspend fun getPlaylists(): List<Playlist> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            val url = FeiniuUrl.endpoint(apiBase, "playlist/list")
+            val data = dataOf(get(url), url) ?: return@runCatchingSuspend emptyList<Playlist>()
+            val list = data.get("list")?.takeIf { it.isJsonArray }?.asJsonArray
+                ?: return@runCatchingSuspend emptyList<Playlist>()
+            val basic = list.mapNotNull { el ->
+                val obj = el as? JsonObject ?: return@mapNotNull null
+                val guid = str(obj, "guid") ?: return@mapNotNull null
+                Triple(
+                    guid,
+                    str(obj, "name") ?: "未命名歌单",
+                    str(obj, "coverId")
+                )
+            }
+            // 曲目数并发补齐（上限 4），单个失败不影响整体
+            coroutineScope {
+                basic.chunked(METADATA_CONCURRENCY).flatMap { chunk ->
+                    chunk.map { (guid, name, coverId) ->
+                        async {
+                            val count = fetchPlaylistTrackCount(guid)
+                            Playlist(
+                                id = ID_PREFIX + guid,
+                                name = name,
+                                coverUrls = listOfNotNull(FeiniuUrl.coverUrl(apiBase, coverId, COVER_SIZE)),
+                                songCount = count
+                            )
+                        }
+                    }.awaitAll()
+                }
+            }
+        }.onFailure { AppLog.e(TAG, "getPlaylists failed", it) }.getOrDefault(emptyList())
+    }
+
+    private suspend fun fetchPlaylistTrackCount(guid: String): Int {
+        val url = FeiniuUrl.endpoint(apiBase, "playlist/detail", "guid" to guid)
+        return try {
+            withAuthRetry { intOf(dataOf(get(url), url), "trackCount") }
+        } catch (e: Exception) {
+            AppLog.d(TAG, "playlist/detail failed for guid=$guid: ${e.message}")
+            0
+        }
+    }
+
+    /** `GET track/playlist-detail/list?playlistGUID=&sort=trackAddedAt,desc` */
+    override suspend fun getPlaylistSongs(playlistId: String): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages(
+                "track/playlist-detail/list",
+                "playlistGUID" to stripPrefix(playlistId),
+                "sort" to "trackAddedAt,desc"
+            ) { parseTrack(it) }
+        }.onFailure { AppLog.e(TAG, "getPlaylistSongs failed", it) }.getOrDefault(emptyList())
+    }
+
+    // ==================== 收藏 ====================
+
+    /**
+     * 切换收藏：`favorite-track/create` / `favorite-track/delete`
+     *
+     * 按入参 [isCurrentlyFavorite] 决定方向，不再"先 add 失败再 remove"
+     * （旧实现那样做会导致无法真正取消收藏）。
+     * 请求体固定 `{"trackGUID": "<guid>"}`，成功响应 `data` 可能为 null。
+     */
+    override suspend fun toggleFavorite(songId: String, isCurrentlyFavorite: Boolean): Boolean = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            // 静默重登覆盖：收藏切换不再因令牌过期静默失败
+            withAuthRetry { doToggleFavorite(stripPrefix(songId), isCurrentlyFavorite) }
+        }.onFailure { AppLog.e(TAG, "toggleFavorite failed", it) }.getOrDefault(false)
+    }
+
+    private fun doToggleFavorite(trackGuid: String, isCurrentlyFavorite: Boolean): Boolean {
+        val path = if (isCurrentlyFavorite) "favorite-track/delete" else "favorite-track/create"
+        val body = JsonObject().apply { addProperty("trackGUID", trackGuid) }.toString()
+        val url = FeiniuUrl.endpoint(apiBase, path)
+        val envelope = post(url, body, authenticated = true) ?: return false
+        // T1（2026-10-18）：`asInt` 在 code 为字符串/对象时会抛异常，改用 intOf；
+        // `getAsJsonObject("data")` 在 data 为数组/字符串时抛异常，改用安全访问器。
+        val code = intOf(envelope, "code")
+        if (code != 0) {
+            AppLog.w(TAG, "toggleFavorite failed: code=$code msg=${str(envelope, "msg")}")
+            return false
+        }
+        return true
+    }
+
+    /** `GET favorite-track/list?page&size&sort=favoriteAt,desc` */
+    override suspend fun getFavorites(): List<Song> = withContext(Dispatchers.IO) {
+        runCatchingSuspend {
+            fetchAllPages("favorite-track/list", "sort" to "favoriteAt,desc") { parseTrack(it) }
+        }.onFailure { AppLog.e(TAG, "getFavorites failed", it) }.getOrDefault(emptyList())
+    }
+
+    // ==================== 内部：传输层 ====================
+
+    /** 令牌失效（code 99999 / 120001 或 HTTP 401），触发一次静默重登 */
+    private class AuthExpiredException : Exception("feiniu token expired")
+
+    private fun get(url: String, authenticated: Boolean = true): JsonObject? =
+        execute(Request.Builder().url(url).get().build(), url, authenticated)
+
+    private fun post(url: String, jsonBody: String, authenticated: Boolean): JsonObject? {
+        val body = jsonBody.toRequestBody("application/json".toMediaType())
+        return execute(Request.Builder().url(url).post(body).build(), url, authenticated)
+    }
+
+    /**
+     * 执行请求并返回**完整信封**（`{code,msg,data}`）。
+     *
+     * @return 信封；传输失败或 HTTP 非 2xx 时返回 null
+     * @throws AuthExpiredException 401 或 code 99999/120001
+     */
+    private fun execute(request: Request, url: String, authenticated: Boolean): JsonObject? {
+        return try {
+            val builder = request.newBuilder().applyAccessCodeHeaders()
+            if (authenticated) {
+                if (userToken.isBlank()) {
+                    AppLog.w(TAG, "execute: no token for ${UrlSanitizer.sanitize(url)}")
+                    return null
+                }
+                // 真实协议：原始 token，无 Bearer 前缀
+                builder.header("Authorization", userToken)
+            }
+            client.newCall(builder.build()).execute().use { response ->
+                if (response.code == 401) {
+                    lastFailure = Failure(R.string.feiniu_err_token_expired)
+                    throw AuthExpiredException()
+                }
+                if (!response.isSuccessful) {
+                    AppLog.w(TAG, "HTTP ${response.code} url=${UrlSanitizer.sanitize(url)}")
+                    lastFailure = Failure(R.string.feiniu_err_http_status, listOf(response.code))
+                    return null
+                }
+                val text = response.body?.string()
+                if (text.isNullOrBlank()) return null
+                val parsed = JsonParser.parseString(text)
+                if (!parsed.isJsonObject) return null
+                parsed.asJsonObject
+            }
+        } catch (e: AuthExpiredException) {
+            throw e
+        } catch (e: Exception) {
+            AppLog.e(TAG, "request error url=${UrlSanitizer.sanitize(url)}", e)
+            recordNetworkError(e)
+            null
+        }
+    }
+
+    /**
+     * 把网络异常映射为用户可读的短原因。
+     *
+     * ⚠️ **只取异常类名，不取 `e.message`** —— 消息里可能带 URL（含凭据参数）
+     * 或内部主机名。沿 cause 链找第一个已知网络异常类型；找不到就用最外层类名兜底。
+     */
+    private fun recordNetworkError(e: Exception) {
+        var cause: Throwable? = e
+        var depth = 0
+        while (cause != null && depth < MAX_CAUSE_DEPTH) {
+            if (cause.javaClass.name in NETWORK_ERROR_NAMES) {
+                lastFailure = Failure(R.string.feiniu_err_network, listOf(cause.javaClass.simpleName))
+                return
+            }
+            cause = cause.cause
+            depth++
+        }
+        lastFailure = Failure(R.string.feiniu_err_network, listOf(e.javaClass.simpleName))
+    }
+
+    /**
+     * 取信封中的 `data` 对象。
+     *
+     * @return `data`；信封 code != 0 时返回 null（已记日志）
+     * @throws AuthExpiredException 令牌失效
+     */
+    private fun dataOf(envelope: JsonObject?, url: String): JsonObject? {
+        if (envelope == null) return null
+        // T1（2026-10-18）：`asInt` 在 code 为字符串/对象时会抛异常，改用 intOf；
+        // `getAsJsonObject("data")` 在 data 为数组/字符串时抛异常，改用安全访问器。
+        val code = intOf(envelope, "code")
+        if (code != 0) {
+            val msg = str(envelope, "msg").orEmpty()
+            when (code) {
+                99999, 120001 -> {
+                    lastFailure = Failure(R.string.feiniu_err_token_expired)
+                    throw AuthExpiredException()
+                }
+                120002 -> {
+                    AppLog.w(TAG, "account disabled: code=$code msg=$msg")
+                    lastFailure = envelopeFailure(code, msg)
+                }
+                100005 -> {
+                    AppLog.d(TAG, "not found: code=$code url=${UrlSanitizer.sanitize(url)}")
+                    // 资源不存在是正常业务结果，不污染连接诊断文案
+                }
+                else -> {
+                    AppLog.w(TAG, "api error code=$code msg=$msg url=${UrlSanitizer.sanitize(url)}")
+                    lastFailure = envelopeFailure(code, msg)
+                }
+            }
+            return null
+        }
+        return envelope.get("data")?.takeIf { it.isJsonObject }?.asJsonObject
+    }
+
+    // ==================== 内部：分页 ====================
+
+    /** 翻页拉取并解析，`singlePage=true` 时只取指定页 */
+    private suspend fun <T> fetchAllPages(
+        path: String,
+        vararg extra: Pair<String, Any?>,
+        page: Int = 1,
+        size: Int = DEFAULT_PAGE_SIZE,
+        singlePage: Boolean = false,
+        parse: (JsonObject) -> T?
+    ): List<T> {
+        val result = ArrayList<T>()
+        var currentPage = page.coerceAtLeast(1)
+        var pagesFetched = 0
+        while (pagesFetched < MAX_PAGES) {
+            // P2-7 修复（2026-09-16）：取整个 `data` 信封（同时含 list 与 total）。
+            // 原实现只用 `items.size() < size` 判末页——服务端某页因限流/过滤少发几条时
+            // 会被误判为末页，后续页被静默截断（收藏/全量搜索少歌且无任何日志）。
+            // 现在优先以 `data.total` 判定。
+            val data = fetchPageEnvelope(path, currentPage, size, *extra) ?: break
+            // T1（2026-10-18）：`getAsJsonArray` 在 `list` 类型异常时抛
+            // IllegalStateException（整页崩），改安全访问器后按「空页」处理。
+            val items = data.get("list")?.takeIf { it.isJsonArray }?.asJsonArray ?: break
+            // T0（2026-10-18）：**逐条异常隔离**。
+            //
+            // 原实现 `parse(obj)?.let { ... }` 没有异常隔离：服务端任意一条曲目的字段
+            // 类型异常（如 CUE 转码产生的 `duration:"154100.5"`、`album` 是字符串而非
+            // 对象、`artists` 是对象而非数组）都会让 Gson 的 `asLong` /
+            // `getAsJsonObject` 抛 IllegalStateException / NumberFormatException，
+            // 进而**中断整个 forEach** —— 一层层冒泡到 `runCatchingSuspend` 被吞成
+            // `getOrDefault(emptyList())`，最终整页 500 首全部丢失，UI 显示 0 首。
+            //
+            // 改为逐条 runCatching 后，一条脏数据只丢弃它自己，其余正常入列表。
+            // 这是 v2.39.3「飞牛歌曲列表为 0」的根因修复（真机 v2.39.2 复现确认）。
+            //
+            // 🙏 感谢 @Chengxi-x 提供本方案：逐条容错 + parseTrack 安全访问器两处
+            // 修改思路均由该用户实测反馈给出。详见 CHANGELOG v2.39.3「致谢」。
+            items.forEach { el ->
+                val obj = el as? JsonObject ?: return@forEach
+                runCatching { parse(obj) }
+                    .onFailure { e ->
+                        AppLog.w(TAG, "parse item failed in $path: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                    .getOrNull()
+                    ?.let { result.add(it) }
+            }
+            pagesFetched++
+            if (singlePage || items.size() == 0) break
+            // total 缺失时用 -1 表示「未知」，退回 items.size() 判末页
+            val total = if (data.get("total") == null) -1 else intOf(data, "total")
+            val reachedEnd = if (total >= 0) {
+                // 已请求 pagesFetched 页、每页 size 条，覆盖 total 即到末页
+                pagesFetched.toLong() * size >= total
+            } else {
+                // 服务端未回 total 时退回旧判据，保持向后兼容
+                items.size() < size
+            }
+            if (reachedEnd) break
+            currentPage++
+        }
+        return result
+    }
+
+    /** 翻页拉取原始 JsonObject（不解析），供需要下标信息的场景使用 */
+    private suspend fun fetchAllPagesRaw(
+        path: String,
+        vararg extra: Pair<String, Any?>
+    ): List<JsonObject> = fetchAllPages(path, *extra) { it }
+
+    /** 取单页的 `data` 信封（同时含 `list` 与 `total`）；失败或不存在时返回 null */
+    private suspend fun fetchPageEnvelope(
+        path: String,
+        page: Int,
+        size: Int,
+        vararg extra: Pair<String, Any?>
+    ): JsonObject? = withAuthRetry {
+        val url = FeiniuUrl.endpoint(
+            apiBase, path,
+            *extra,
+            "page" to page,
+            "size" to size
+        )
+        dataOf(get(url), url)
+    }
+
+    /** 取 `data.total` 用于分页显示与随机取页 */
+    private suspend fun fetchTotal(path: String, vararg extra: Pair<String, Any?>): Int = withAuthRetry {
+        val url = FeiniuUrl.endpoint(apiBase, path, *extra, "page" to 1, "size" to 1)
+        val data = dataOf(get(url), url) ?: return@withAuthRetry 0
+        if (data.get("total") != null) intOf(data, "total")
+        else data.get("list")?.takeIf { it.isJsonArray }?.asJsonArray?.size() ?: 0
+    }
+
+    /**
+     * 令牌失效时静默重登一次再重试。
+     * 重登凭据来自 `initialize` 时保存的密码摘要。
+     * 并发场景（如 getSongsByIds 并发 4）：互斥 + 令牌代数去重，只真正重登一次。
+     */
+    private suspend fun <T> withAuthRetry(block: suspend () -> T): T {
+        return try {
+            block()
+        } catch (e: AuthExpiredException) {
+            if (loginUsername.isBlank() || loginPasswordSha.isBlank()) throw e
+            AppLog.w(TAG, "token expired, attempting silent re-login")
+            val seenGeneration = tokenGeneration
+            reloginMutex.withLock {
+                if (tokenGeneration == seenGeneration) {
+                    if (!login(loginUsername, loginPasswordSha)) throw e
+                }
+            }
+            block()
+        }
+    }
+
+    // ==================== 内部：解析 ====================
+
+    private fun parseAlbum(obj: JsonObject): Album? {
+        val guid = str(obj, "guid") ?: return null
+        val name = str(obj, "name")?.takeIf { it.isNotBlank() } ?: return null
+        val coverId = str(obj, "coverId")
+        if (coverId != null) synchronized(albumCoverIds) { albumCoverIds[guid] = coverId }
+        // AlbumDto.artists 是数组（可能为空），展示时取首位。
+        // T1（2026-10-18）：`getAsJsonArray` 在字段类型不符时会抛异常（整页崩溃），
+        // 改用安全访问器 —— 与 parseTrack 保持一致的防御水平。
+        val artistName = obj.get("artists")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.firstOrNull()
+            ?.takeIf { it.isJsonObject }
+            ?.asJsonObject
+            ?.let { str(it, "name") }
+        // releaseDate 形如 "2019-05-01"，取前 4 位作年份
+        val year = str(obj, "releaseDate")?.take(4)?.toIntOrNull()
+        return Album(
+            id = ID_PREFIX + guid,
+            name = name,
+            artist = artistName ?: "",
+            coverUrl = FeiniuUrl.coverUrl(apiBase, coverId, COVER_SIZE),
+            year = year,
+            songCount = intOf(obj, "trackCount")
+        )
+    }
+
+    private fun parseArtist(obj: JsonObject): Artist? {
+        val guid = str(obj, "guid") ?: return null
+        val name = str(obj, "name")?.takeIf { it.isNotBlank() } ?: return null
+        val coverId = str(obj, "coverId")
+        if (coverId != null) synchronized(artistCoverIds) { artistCoverIds[guid] = coverId }
+        return Artist(
+            id = ID_PREFIX + guid,
+            name = name,
+            coverUrl = FeiniuUrl.coverUrl(apiBase, coverId, COVER_SIZE),
+            albumCount = intOf(obj, "albumCount"),
+            songCount = intOf(obj, "trackCount")
+        )
+    }
+
+    /**
+     * 解析服务端 TrackDto。
+     *
+     * @param fallbackTrackNumber 列表接口不返回 trackNo，由调用方按序号补
+     * @param audioSpec 外部传入的 audioSpec（`track/metadata` 场景），为空则取对象内的
+     */
+    private fun parseTrack(obj: JsonObject, fallbackTrackNumber: Int = 0, audioSpec: JsonObject? = null): Song? {
+        val guid = str(obj, "guid") ?: return null
+        val title = str(obj, "title")?.takeIf { it.isNotBlank() } ?: return null
+
+        val coverId = str(obj, "coverId")
+        if (coverId != null) synchronized(trackCoverIds) { trackCoverIds[guid] = coverId }
+
+        // T1（2026-10-18）：安全访问器替代强制转换。
+        //
+        // ⚠️ Gson 的 `getAsJsonObject(name)` / `getAsJsonArray(name)` 在字段存在但
+        // **类型不符**时会直接抛 IllegalStateException（不是返回 null）——
+        // 例如服务端把 `album` 发成字符串、把 `artists` 发成单个对象，
+        // 都会让整条曲目解析崩溃。T0 已保证只丢这一条，但没必要丢掉可救的数据。
+        //
+        // 🙏 感谢 @Chengxi-x 提供本方案（安全访问器 + duration 兜底思路）。
+        val albumObj = obj.get("album")?.takeIf { it.isJsonObject }?.asJsonObject
+        val albumGuid = str(albumObj, "guid")
+        val albumName = str(albumObj, "name")
+        val albumCoverId = str(albumObj, "coverId")
+        if (albumGuid != null && albumCoverId != null) {
+            synchronized(albumCoverIds) { albumCoverIds[albumGuid] = albumCoverId }
+        }
+
+        val artistNames = ArrayList<String>()
+        var firstArtistGuid: String? = null
+        var firstArtistCoverId: String? = null
+        obj.get("artists")?.takeIf { it.isJsonArray }?.asJsonArray?.forEach { el ->
+            val artistObj = el as? JsonObject ?: return@forEach
+            str(artistObj, "name")?.takeIf { it.isNotBlank() }?.let { artistNames.add(it) }
+            val ag = str(artistObj, "guid")
+            val ac = str(artistObj, "coverId")
+            if (firstArtistGuid == null && ag != null) firstArtistGuid = ag
+            if (firstArtistCoverId == null && ac != null) firstArtistCoverId = ac
+            if (ag != null && ac != null) synchronized(artistCoverIds) { artistCoverIds[ag] = ac }
+        }
+
+        // duration 单位已是毫秒（参考项目 Dto: durationMs = duration），不要 ×1000。
+        //
+        // ⚠️ 不能写成 `el?.asLong`：Gson 的 asLong 对 `"154100"` 能解析（内部走
+        // Double.parse），但对 `"154100.5"` / `"2:33"` / `"abc"` 会抛
+        // NumberFormatException。CUE 转码/第三方导入的库经常产生这类值。
+        // 用 parseDurationMs 兜住：数字取长整、纯数字字符串取小数再截断、其余回退 null。
+        val spec = audioSpec ?: obj.get("audioSpec")?.takeIf { it.isJsonObject }?.asJsonObject
+        val durationMs = parseDurationMs(obj.get("duration"))
+            ?: parseDurationMs(spec?.get("duration"))
+            ?: 0L
+
+        return Song(
+            id = ID_PREFIX + guid,
+            title = title,
+            artist = artistNames.joinToString(" / "),
+            artistId = firstArtistGuid?.let { ID_PREFIX + it },
+            album = albumName ?: "",
+            albumId = albumGuid?.let { ID_PREFIX + it },
+            coverUrl = FeiniuUrl.coverUrl(apiBase, coverId ?: albumCoverId ?: firstArtistCoverId, COVER_SIZE),
+            // 播放解析链（PlayerViewModel.resolveStreamUrl → getSongsByIds）依赖本字段，解析期即填充
+            streamUrl = FeiniuUrl.streamUrl(apiBase, guid),
+            durationMs = durationMs,
+            trackNumber = fallbackTrackNumber,
+            // 同 [BITRATE_UNVERIFIED]：单位未确认，不填
+            bitrate = BITRATE_UNVERIFIED
+        )
+    }
+
+    // ==================== 内部：工具 ====================
+
+    /** 去掉 `feiniu_` 前缀 */
+    private fun stripPrefix(id: String): String =
+        if (id.startsWith(ID_PREFIX)) id.substring(ID_PREFIX.length) else id
+
+    /**
+     * 安装级稳定的 deviceId。
+     *
+     * 持久化到 SharedPreferences，避免每次连接都生成新设备 ID
+     * 导致服务端设备列表膨胀。拿不到 Context 时退化为进程内稳定值。
+     */
+    @Volatile
+    private var memoryDeviceId: String = PREFS_UNSET
+
+    @Synchronized
+    private fun deviceId(): String {
+        val cached = memoryDeviceId
+        if (cached.isNotEmpty()) return cached
+        val prefs = appContext?.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        var id = prefs?.getString(PREF_DEVICE_ID, null)
+        if (id.isNullOrBlank()) {
+            id = UUID.randomUUID().toString()
+            prefs?.edit()?.putString(PREF_DEVICE_ID, id)?.apply()
+        }
+        memoryDeviceId = id
+        return id
+    }
+
+    /** SHA-256 小写 hex（与参考项目 `PasswordHash.fromPlaintext` 一致） */
+    private fun sha256Hex(input: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * suspend 版本的 runCatching。
+     *
+     * 标准库 `runCatching` 的 block 不是 suspend，内部无法调用挂起函数
+     * （本适配器的取数流程全是 suspend），故自定义一个等价物。
+     */
+    private suspend fun <T> runCatchingSuspend(block: suspend () -> T): Result<T> =
+        try {
+            Result.success(block())
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+
+    /** 安全取字符串：非基本类型或异常时返回 null（避免 Gson 抛 IllegalStateException） */
+    private fun str(obj: JsonObject?, name: String): String? {
+        val element = obj?.get(name) ?: return null
+        if (!element.isJsonPrimitive) return null
+        return try {
+            val value = element.asString
+            if (value == "null") null else value
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 安全取整数：字段缺失、非基本类型、或内容不是数字时返回 0（不抛异常）。
+     *
+     * ⚠️ 为什么不用 `el.asInt`：Gson 对 `"12abc"`、JSON `null`、对象都会抛
+     * NumberFormatException / IllegalStateException。列表解析场景一条脏数据
+     * 就能拖垮整页（见 T0），统计字段没必要冒这个风险。
+     */
+    private fun intOf(obj: JsonObject?, name: String): Int {
+        val el = obj?.get(name) ?: return 0
+        if (el.isJsonNull || !el.isJsonPrimitive) return 0
+        return try {
+            val prim = el.asJsonPrimitive
+            if (prim.isNumber) prim.asInt
+            else prim.asString.trim().toIntOrNull() ?: 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    /**
+     * 尽最大努力把 JSON 值解析为 Long；无法解析返回 `null`（调用方自行回退）。
+     *
+     * ⚠️ 为什么不能用 `el.asLong`：
+     * Gson 的 `JsonPrimitive.asLong` 只保证「数字」可用，对字符串走
+     * `Double.parseDouble` 再转 long —— 传 `"154100"` 能成功，
+     * 但传 `"154100.5"` 会抛 NumberFormatException，`"2:33"`、`"abc"`、
+     * `true`、JSON `null` 同样抛。飞牛上由 CUE 分轨 / 第三方导入产生的
+     * 曲目经常出现这类值，一条就会让整页解析崩溃（v2.39.3 修复）。
+     *
+     * 支持形态：
+     * - 数字 `154100` / `154100.5` → 154100（截断小数）
+     * - 纯数字字符串 `"154100"` / `"154100.5"` → 同上
+     * - 其它（时间戳格式、非法字符、null）→ null
+     */
+    private fun longOf(el: JsonElement?): Long? {
+        if (el == null || el.isJsonNull) return null
+        if (!el.isJsonPrimitive) return null
+        return try {
+            val prim = el.asJsonPrimitive
+            if (prim.isNumber) {
+                // 数字：Gson 的 asLong 对浮点会截断小数（实测 154100.5 → 154100），不抛异常
+                prim.asLong
+            } else {
+                val text = prim.asString.trim()
+                if (text.isEmpty()) null
+                // 字符串：优先按整数解析，失败再按浮点截断
+                else text.toLongOrNull() ?: text.toDoubleOrNull()?.toLong()
+            }
+        } catch (e: Exception) {
+            // 超大数超出 Long 范围等极端情况：回退 null，不让单条脏数据影响整页
+            null
+        }
+    }
+
+    /** 毫秒时长提取：语义化包装 [longOf]，供 duration / bitrate 等数值字段复用 */
+    private fun parseDurationMs(el: JsonElement?): Long? = longOf(el)
+
+    /** 定长 LRU 缓存（访问序）；所有访问需外部 synchronized */
+    private class LruCache<K, V>(maxSize: Int) : LinkedHashMap<K, V>(maxSize, 0.75f, true) {
+        private val limit = maxSize
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?): Boolean = size > limit
+    }
+}

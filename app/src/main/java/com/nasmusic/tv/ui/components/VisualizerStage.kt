@@ -1,0 +1,822 @@
+package com.nasmusic.tv.ui.components
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.FloatState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.tv.material3.Icon
+import androidx.tv.material3.Text
+import com.nasmusic.tv.R
+import com.nasmusic.tv.data.model.LyricsLine
+import com.nasmusic.tv.data.model.Song
+import com.nasmusic.tv.data.model.VisualQuality
+import com.nasmusic.tv.data.model.VisualizerTheme
+import com.nasmusic.tv.ui.theme.NasMusicColors
+import com.nasmusic.tv.visualizer.AudioFrame
+import com.nasmusic.tv.visualizer.CoverPalette
+import com.nasmusic.tv.visualizer.FpsMeter
+import com.nasmusic.tv.visualizer.RenderContext
+import com.nasmusic.tv.visualizer.RendererSwapper
+import com.nasmusic.tv.visualizer.VisualizerRenderer
+import com.nasmusic.tv.visualizer.VisualizerRendererFactory
+
+/**
+ * 帧率读数的开关键（`Settings.Global`，只读）。
+ *
+ * 开：`adb shell settings put global nasmusic_fps 1` ⇒ 重进可视化即右上角显示当前效果帧率。
+ * 关：`adb shell settings put global nasmusic_fps 0`（或直接删键）。
+ *
+ * 走系统全局设置而不是 App 设置页：release 包可用、零持久化 plumbing，
+ * 且⛔ 不会在普通用户的播放器 UI 上留下常驻调试信息。
+ */
+private const val FPS_SETTING_KEY = "nasmusic_fps"
+
+/**
+ * 全屏可视化舞台（三层结构）。
+ *
+ * ```
+ * ③ 前景层：顶部歌词 / 左下歌曲信息 / 底部指示器+控制栏
+ * ② 效果层：Canvas —— VisualizerRenderer.draw(frame)
+ * ① 背景层：纯暗色底（不叠加封面图，突出频谱本身）
+ * ```
+ *
+ * 绘制循环用 `withFrameNanos` 驱动，**不走 Compose 重组**——
+ * 频谱以 30fps 变化，若每帧重组会白白消耗性能。
+ *
+ * **T6 双缓冲配合**：绘制循环不重组，若直接传 `AudioFrame` 引用，
+ * 整个动画期间将固定读同一实例——写端下一轮翻转后即开始写该实例，
+ * 撕裂依旧。故 [frame] 为**每帧求值**的 provider：draw 开头捕获一次
+ * 当前 front（1-writeIndex），绘制期间引用不变。
+ */
+@Composable
+fun VisualizerStage(
+    song: Song?,
+    frame: () -> AudioFrame,
+    cover: ImageBitmap?,
+    palette: CoverPalette,
+    lyrics: List<LyricsLine>?,
+    progressMs: Long,
+    theme: VisualizerTheme,
+    quality: VisualQuality,
+    /**
+     * 照片墙编排器（阶段 10，§14.2.5）。
+     *
+     * ⛔ **只在这里接线，不在这里实现**：本组件只做两件事 ——
+     * ① 帧循环里 `onFrame(frame)`（与 draw 同帧、同线程）；
+     * ② `renderCtx.update(...)` 之后 `applyTo(renderCtx)`（零分配写 7 个字段）。
+     * 「扫哪些来源 / 什么时候换图 / 用哪个转场」全在控制器里。
+     *
+     * `null` = 未接线（测试 / 预览环境）⇒ 两个调用点都退化为空操作，
+     * **其余 35 个渲染器的行为完全不变**。
+     */
+    photoWall: com.nasmusic.tv.visualizer.photo.PhotoWallController? = null,
+    /**
+     * 三来源开关之「或」（§7.4）—— 决定底部指示器里**要不要显示**「照片墙」。
+     *
+     * ⛔ 必须由调用方传入、不能用默认值：三个来源全关时指示器上不该出现一个
+     * 左右键也切不到的效果，反之亦然 —— 两处必须用**同一个**布尔值。
+     */
+    photoWallAvailable: Boolean,
+    isTV: Boolean,
+    onExit: () -> Unit,
+    onNextTheme: () -> Unit,
+    onPrevTheme: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val density = LocalDensity.current
+    val safeArea = 0.05f
+    // 手机左上角返回按钮的无障碍描述（原先硬编码 "返回"，按项目约定改用字符串资源）
+    val backDescription = stringResource(R.string.common_back)
+
+    // TV 焦点：进入舞台立即夺焦。VisualizerOverlay 直接覆盖在 UI 树上，
+    // 若不夺焦，D-Pad 事件仍路由到下方被遮挡界面的焦点节点，onPreviewKeyEvent 收不到，
+    // 表现为"遥控器左右键无法切换效果"（真机实测）。
+    val focusRequester = remember { FocusRequester() }
+
+    // ── 渲染器生命周期（自动导演档 600ms 交叉淡入）────────────
+    val renderCtx = remember { RenderContext() }
+    // LocalContext 供默认工厂创建 View 型渲染器（three-globe WebView）用
+    val context = LocalContext.current
+    val swapper = remember { RendererSwapper(context) }
+    // T1.6.3（§四 G16 伴生 · v1.15 修正口径）：原 `var canvasSize by remember { ... }` 已删 ——
+    // 它在 Canvas draw 块内每帧写入、又在同一块内被 renderCtx.update 读取（§2.4 曾误判「只写不读」），
+    // 改为 draw 块内局部 val（§12.4 偏差记录：状态 → 局部值，行为逐帧等价、少一个 State 订阅）。
+
+    // 淡入透明度：由绘制循环逐帧写入，在绘制阶段读取 → 只重绘不重组
+    val fadeAlpha = remember { mutableFloatStateOf(1f) }
+    val prevAlpha = remember { mutableFloatStateOf(0f) }
+    // 渲染器 draw 异常一次性告警标记（避免逐帧刷日志）
+    val rendererFailed = remember { mutableStateOf(false) }
+    // 正在淡出的旧渲染器（null = 无旧层）；用 State 以便出现/消失时重组
+    val prevRenderer = remember { mutableStateOf<VisualizerRenderer?>(null) }
+    // 当前生效渲染器的 State 快照：swapper.current 是普通 var（sync 后才更新、
+    // 且不触发重组），view 型旁路的 AndroidView / Canvas 分支切换依赖此快照重组。
+    // 首次 sync 前为 null ⇒ 走 Canvas 空帧分支（与改造前行为一致）。
+    val currentRenderer = remember { mutableStateOf<VisualizerRenderer?>(null) }
+
+    // 歌词级常量（最长行字数 / 最长行文本）：只随 lyrics 变化。
+    // 每帧重算是 O(N) 全量扫描，必须缓存。
+    val lyricMetrics = remember(lyrics) { computeLyricMetrics(lyrics) }
+
+    // ── 帧率读数（真机验收用）───────────────────────────────────
+    // 开关走 Settings.Global 而非设置页：⛔ 不在播放器 UI 上留常驻调试信息，
+    // 又能 release 包直接开 —— `adb shell settings put global nasmusic_fps 1`（0 或删键即关）。
+    // 只在进入舞台时读一次（切效果 / 重启 App 后生效），不做轮询。
+    val showFps = remember {
+        runCatching {
+            android.provider.Settings.Global.getInt(context.contentResolver, FPS_SETTING_KEY, 0) == 1
+        }.getOrDefault(false)
+    }
+    val fpsMeter = remember { FpsMeter() }
+    val fpsValue = remember { mutableFloatStateOf(0f) }
+
+    // 主题 / 画质变化 → 同步渲染器（自动导演走淡入，手动切换硬切）
+    LaunchedEffect(theme, quality) {
+        val lyricInfo = computeLyricInfo(lyrics, progressMs, lyricMetrics)
+        renderCtx.update(quality, palette, cover, Size.Zero, 0f,
+            System.currentTimeMillis(), song?.title,
+            lyricInfo.line, lyricInfo.nextLine, lyricInfo.progress,
+            lyricInfo.hasWords, lyricInfo.lineIndex, lyricInfo.wordStartTimes,
+            lyricInfo.maxLineChars, lyricInfo.longestLine, song?.id)
+        // 照片墙生命周期（阶段 10）：进入 → 开始扫描（若未扫过）；离开 → 停时钟、停预取。
+        // ⛔ 必须在帧循环**之前**：本 `LaunchedEffect` 声明在前，先启动 ⇒ `onFrame` 第一帧
+        //    就已经是 `active` 状态。放在帧循环之后会白跑一帧。
+        // ⚠️ 幂等：画质变化也会重跑这个 effect，`onThemeEntered()` 重复调用无副作用。
+        if (theme == VisualizerTheme.PHOTO_WALL) photoWall?.onThemeEntered() else photoWall?.onThemeExited()
+
+        // crossfade 能力保留在 RendererSwapper（有单测覆盖）；自动导演档删除后
+        // UI 层已无使用场景，因此恒为 false（原为死参数，现收敛到调用处）
+        if (swapper.sync(theme, quality, false, renderCtx, System.currentTimeMillis())) {
+            // 快照同步进 State：swapper.current 变化本身不触发重组，
+            // 这里写 State 才能让下面的 Canvas / AndroidView 分支切换生效
+            currentRenderer.value = swapper.current
+            prevRenderer.value = swapper.previous
+            if (swapper.isCrossfading) {
+                fadeAlpha.floatValue = 0f
+                prevAlpha.floatValue = 1f
+            } else {
+                fadeAlpha.floatValue = 1f
+                prevAlpha.floatValue = 0f
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            // 舞台被移除（退出全屏可视化）⇒ 停照片墙的时钟与扫描。
+            // ⚠️ 缓存**不**释放（控制器在 ViewModel 里、跨重组存活）⇒ 再进来是瞬时的。
+            photoWall?.onThemeExited()
+            swapper.release()
+        }
+    }
+
+    // ── 绘制循环（不触发重组）──────────────────────────────────
+    var tick by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos { ns ->
+                tick = ns
+                if (showFps && fpsMeter.onFrame(ns)) fpsValue.floatValue = fpsMeter.fps
+                if (swapper.isCrossfading) {
+                    val ms = ns / 1_000_000L
+                    swapper.advance(ms)
+                    fadeAlpha.floatValue = swapper.currentAlpha(ms)
+                    prevAlpha.floatValue = swapper.previousAlpha(ms)
+                    prevRenderer.value = swapper.previous
+                }
+                // 照片墙：与 draw 同帧、同线程（主线程）。
+                // ⛔ 必须在下面 Canvas 的 `renderCtx.update(...)` **之前**跑完，
+                //    这样 `applyTo` 写进 `RenderContext` 的值与本次 draw 看到的是同一帧。
+                photoWall?.onFrame(frame())
+            }
+        }
+    }
+
+    // ── 效果名 Toast ───────────────────────────────────────────
+    var toastVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(theme) {
+        toastVisible = true
+        kotlinx.coroutines.delay(2500)
+        toastVisible = false
+    }
+
+    // 进入舞台立即把焦点交给舞台 Box（TV 遥控器 D-Pad 依赖焦点路由）
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .focusRequester(focusRequester)
+            .focusable()
+            .onPreviewKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown) {
+                    when (e.key) {
+                        Key.DirectionLeft -> { onPrevTheme(); true }
+                        Key.DirectionRight -> { onNextTheme(); true }
+                        // 上键：无动作（控制栏已移除）
+                        Key.DirectionUp -> true
+                        else -> false
+                    }
+                } else false
+            }
+            .pointerInput(Unit) {
+                // 手机：左右滑动切换（阈值 80dp）
+                var totalDrag = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { totalDrag = 0f },
+                    onHorizontalDrag = { _, amount -> totalDrag += amount },
+                    onDragEnd = {
+                        val threshold = with(density) { 80.dp.toPx() }
+                        when {
+                            totalDrag > threshold -> onPrevTheme()
+                            totalDrag < -threshold -> onNextTheme()
+                        }
+                    }
+                )
+            }
+    ) {
+        // ⭐⭐ **T1.7.1（2026-10-05 性能诊断实验）**：离屏层是否挂载的**判据读在这里**
+        //   （**组合作用域**），⛔ 不能只写在下面那个 `graphicsLayer { }` block 里。
+        //
+        //   ⚠️ **为什么必须提到组合作用域**：`Modifier.graphicsLayer { }` 的 block 在状态失效时
+        //   **会**重跑，但它只更新 alpha / translation / scale 这些**标量**；
+        //   **离屏层本身是在元素 `onAttached` 时按 `compositingStrategy` 决定要不要建的**，
+        //   block 重跑**不会**新建或销毁它。
+        //   ⭐ 提到组合作用域后，它翻转时**整个 `graphicsLayer` 元素被重新 apply**
+        //   ⇒ `compositingStrategy` 真的生效 ⇒ **交叉淡入期间照样能挂上离屏**，
+        //   ⛔ **不会**出现「条件化导致淡入永远不挂」那种失效。
+        // ⚠️ 代价：交叉淡入那 ≤600ms 里 `fadeAlpha` 每帧变 ⇒ 本子树每帧重组一次；
+        //   静止期它恒 1.0 ⇒ ⛔ 不重组、⛔ 行为与改动前**完全一致**。
+        //   （`:161` 说 `fadeAlpha`「只重绘不重组」，那指的是**只写在 block 里**的读法；
+        //   ⭐ 在组合作用域读会重组，⛔ 但仅限这 600ms 的过渡期。）
+        //
+        // ⭐ **定稿后的正式说明**（不再是诊断态）：静止期不挂离屏层 ⇒ 海边 `drawSheen` 的
+        //   `BlendMode.Plus` 按 `SrcOver` 呈现 ⇒ 镜面高光不再是加法。
+        //   ⭐ **所有者真机确认无影响**（原话：「湿沙效果很好，镜面高光没啥意义」）⇒ 保留现状。
+        //   ⛔ 不要为此把高光预合成进湿沙刷（`SeasideRenderer` 的 KDoc 判其为视觉偏差），
+        //   ⛔ 也不要把 `Offscreen` 改回无条件挂载。
+        // ⚠️ 实测备注：条件化后**帧率无可测收益**（见 `technical-overview.md` §10.211 的
+        //   「假说证伪」条）⇒ 保留它的理由是**修掉一条本文件自己写明的 TODO**（静止期
+        //   整屏离屏缓冲 1080p ≈ 16.6 MB/帧带宽、收益为零），而不是本机帧率。
+        val needOffscreen = fadeAlpha.floatValue < 1f
+
+        // ① 背景层：纯暗色底（不再叠加封面图，突出频谱效果本身；暗底衬托霓虹荧光）
+        // 每帧只算一次：新层与渐出旧层共用。
+        // 此前两个 Canvas 各算一次（且内部含全量扫描），直接翻倍开销。
+        val lyricInfo = computeLyricInfo(lyrics, progressMs, lyricMetrics)
+
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(palette.background.copy(alpha = 0.72f))
+        )
+
+        // ② 效果层（新效果；交叉淡入时从透明渐显）
+        val active = currentRenderer.value
+        if (active != null && active.isViewBased) {
+            // View 型渲染器旁路（three-globe 等 WebView 渲染器）：
+            // 用 AndroidView 承载，不经 DrawScope —— draw() 不再被调用。
+            // ⛔ 不叠加 graphicsLayer Offscreen/alpha —— 对 View 无效。
+            // key(active)：渲染器实例变化（切主题）⇒ 重建整个组 ⇒ AndroidView 的
+            // factory 重新执行、旧 View 随组销毁，避免「旧 View 配新渲染器」。
+            key(active) {
+                AndroidView(
+                    factory = { ctx -> active.createView(ctx)!! },
+                    modifier = Modifier.fillMaxSize()
+                )
+                // attach 在组合后（此时 factory 已建好 View）、
+                // detach 在离开组合 / 渲染器被 key 换掉时触发
+                DisposableEffect(Unit) {
+                    active.onViewAttached()
+                    onDispose { active.onViewDetached() }
+                }
+            }
+        } else {
+            androidx.compose.foundation.Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    // T9：叠加发光需要离屏层，否则部分 API 版本退化为 SrcOver。
+                    // ⚠️ G14 现状说明（§2.4/v1.14 裁决项 10）：这层目前是**无条件**挂载 ——
+                    //    交叉淡入的 600ms 之外 fadeAlpha 恒 1.0，整屏离屏缓冲（1080p ≈ 16.6 MB/帧带宽）
+                    //    在静止期收益为零、只有成本；T1.7.1 将条件化为 `fadeAlpha < 1f` 才挂。
+                    //    ⛔ 不要因为看到这层就以为「Plus 叠加必须有它」而照抄到新画布。
+                    //
+                    // ⭐⭐ **T1.7.1 已实施**（2026-10-05，**定稿**）：离屏层**条件化挂载**。
+                    //   `compositingStrategy` 在此**赋值**（由元素 `onAttached` 读取），
+                    //   ⭐ 而**判据取自组合作用域的 [needOffscreen]** ⇒ 它翻转时整个元素被
+                    //   重新 apply ⇒ 真正生效（⛔ 不是「block 重跑但没换策略」那种假生效）。
+                    //   ⚠️ 代价（仅过渡期）：见 [needOffscreen] 处的注释。
+                    // ⚠️ **为什么值得做**：静止期整屏离屏缓冲（1080p ≈ 16.6 MB/帧带宽）**收益为零**
+                    //   —— `fadeAlpha` 恒 1.0，alpha 合成与 `SrcOver` 等价。这条 T1.7.1 TODO
+                    //   就是上面 `:334-335` 注释自己写下的（见「G14 现状说明」）。
+                    // ⭐ **对海边效果的影响（已定稿、所有者真机确认）**：静止期没有离屏层 ⇒
+                    //   `drawSheen` 的 `BlendMode.Plus` 按 `SrcOver` 呈现 ⇒ 镜面高光不再是加法。
+                    //   所有者当场看过并判定「湿沙效果很好，镜面高光没啥意义」⇒ 保留现状。
+                    //   ⛔ 不要为此把高光预合成进湿沙刷（`SeasideRenderer` 的 KDoc 判其为视觉偏差）。
+                    .graphicsLayer {
+                        compositingStrategy =
+                            if (needOffscreen) CompositingStrategy.Offscreen
+                            else CompositingStrategy.Auto
+                        alpha = fadeAlpha.floatValue
+                    }
+            ) {
+                // T1.6.3：draw 块内局部 val（原 remember State，读写同块、逐帧等价）
+                val canvasSize = Size(size.width, size.height)
+                // T6：每帧捕获一次 front 引用，绘制期间引用不变
+                val f = frame()
+                // 计算当前歌词行 & 行内进度（给 E23 歌词点阵用）
+                // 复用实例，零分配
+                renderCtx.update(quality, palette, cover, canvasSize,
+                    minOf(size.width, size.height) * safeArea, f.timeMs, song?.title,
+                    lyricInfo.line, lyricInfo.nextLine, lyricInfo.progress,
+                    lyricInfo.hasWords, lyricInfo.lineIndex, lyricInfo.wordStartTimes,
+                    lyricInfo.maxLineChars, lyricInfo.longestLine, song?.id)
+                // 照片墙：零分配写 7 个 `photo*` 字段（§14.2.4 指定「在 update() 之后单独写」）。
+                // ⛔ 必须在 `swapper.current.draw(...)` **之前**：`PhotoRenderer` 读的就是这 7 个字段。
+                photoWall?.applyTo(renderCtx)
+                val cur = swapper.current
+                // tick 参与读取以确保每帧重绘
+                // ⛔ `!cur.isViewBased` 防御：换主题瞬间（sync 后、State 重组前）本分支
+                //    仍是 Canvas，而 swapper.current 已指向新渲染器 —— 若是 view 型
+                //    绝不能在这里调它的 draw()，跳过等重组切到 AndroidView 分支。
+                if (tick >= 0L && cur != null && !cur.isViewBased && fadeAlpha.floatValue > ALPHA_EPS) {
+                    // 渲染器绘制异常若直接抛出会中断整个绘制线程 → 电视上可能表现为
+                    // native 崩溃（Skia 收到非法几何/状态）。捕获后跳过该帧并告警。
+                    try {
+                        with(cur) { draw(f, renderCtx) }
+                    } catch (t: Throwable) {
+                        if (!rendererFailed.value) {
+                            rendererFailed.value = true
+                            android.util.Log.w("VisualizerStage",
+                                "renderer draw failed, skipped frame: ${cur::class.simpleName}", t)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ② 效果层（旧效果；仅交叉淡入期间存在，1→0 淡出）
+        prevRenderer.value?.let { old ->
+            // 防御：view 型渲染器恒硬切（crossfade=false），正常不会进入淡出分支；
+            // 且 AndroidView 无法在 DrawScope 里「淡出」，真进来了也只能跳过。
+            if (old.isViewBased) return@let
+            androidx.compose.foundation.Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        compositingStrategy = CompositingStrategy.Offscreen
+                        alpha = prevAlpha.floatValue
+                    }
+            ) {
+                // T6：旧层独立捕获一次 front，与新层可能差一帧——两帧皆为完整帧
+                val f = frame()
+                renderCtx.update(quality, palette, cover, Size(size.width, size.height),
+                    minOf(size.width, size.height) * safeArea, f.timeMs, song?.title,
+                    lyricInfo.line, lyricInfo.nextLine, lyricInfo.progress,
+                    lyricInfo.hasWords, lyricInfo.lineIndex, lyricInfo.wordStartTimes,
+                    lyricInfo.maxLineChars, lyricInfo.longestLine, song?.id)
+                if (tick >= 0L && prevAlpha.floatValue > ALPHA_EPS) {
+                    try {
+                        with(old) { draw(f, renderCtx) }
+                    } catch (t: Throwable) {
+                        if (!rendererFailed.value) {
+                            rendererFailed.value = true
+                            android.util.Log.w("VisualizerStage",
+                                "prev renderer draw failed, skipped frame: ${old::class.simpleName}", t)
+                        }
+                    }
+                }
+            }
+        }
+
+        val isVintageTv = theme == VisualizerTheme.VINTAGE_TV
+
+        // 怀旧 4:3 反色文字（2026-09-27 二次定稿）：
+        // 仅「黑带」区用白字、画面区一律黑字 —— 分界即 4:3 黑带右缘，
+        // 不随暗角阈值外扩（真机反馈：白字伸进画面太多）。
+        // ⛔ 本机 Android 5.1 无 BlendMode.Difference（API 29+），故用双层裁剪实现。
+        val cfg = LocalConfiguration.current
+        val vintagePillarDp = if (isVintageTv) {
+            maxOf((cfg.screenWidthDp - cfg.screenHeightDp * 4f / 3f) / 2f, 0f).dp
+        } else 0.dp
+        val vintageBandEndPx = with(LocalDensity.current) { (vintagePillarDp - 48.dp).toPx() }
+
+        // ③ 前景层
+        Column(Modifier.fillMaxSize()) {
+            // 顶部歌词行（怀旧效果已自带中间大字歌词，隐藏顶部栏）
+            if (!isVintageTv) {
+                LyricTopBar(
+                    lyrics = lyrics,
+                    progressMs = progressMs,
+                    fallback = song?.let { "${it.title} — ${it.artist ?: ""}" },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 40.dp, start = 48.dp, end = 48.dp)
+                )
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // 效果名 Toast
+            AnimatedVisibility(
+                visible = toastVisible,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            ) {
+                Text(
+                    text = stringResource(theme.displayNameRes),
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 20.sp,
+                    modifier = Modifier
+                        // drawBehind 画圆角矩形：避免 RoundedCornerShape clip 触发
+                        // Android 5.1 hwui Region 段错误（见 ThemeIndicator 注释）
+                        .drawBehind {
+                            drawRoundRect(
+                                color = Color.Black.copy(alpha = 0.35f),
+                                cornerRadius = CornerRadius(12.dp.toPx())
+                            )
+                        }
+                        .padding(horizontal = 20.dp, vertical = 8.dp)
+                )
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // 左下：歌曲信息
+            // 怀旧 4:3：黑带是纯黑背景、画面区是纸底 —— 单色文字必有一侧不可见
+            // （真机反馈：黑字落在纯黑 band 上看不到）。反色文字模式：黑带区白字、
+            // 画面区黑字，双层裁剪、分界 = 黑带右缘；右端以 end 内边距挡在黑带之外。
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 48.dp, bottom = 8.dp, end = vintagePillarDp)
+            ) {
+                // 左黑带区 → 白字（与背景反色）
+                SongInfoTexts(
+                    song = song,
+                    titleColor = Color.White,
+                    artistColor = Color.White.copy(alpha = 0.6f),
+                    modifier = Modifier.drawWithContent {
+                        clipRect(right = vintageBandEndPx) { this@drawWithContent.drawContent() }
+                    }
+                )
+                // 画面区 → 黑字（非怀旧：整体白字、不裁剪，布局与旧版一致）
+                SongInfoTexts(
+                    song = song,
+                    titleColor = if (isVintageTv) Color.Black else Color.White,
+                    artistColor = if (isVintageTv) Color.Black.copy(alpha = 0.6f)
+                    else Color.White.copy(alpha = 0.6f),
+                    modifier = if (isVintageTv) Modifier.drawWithContent {
+                        clipRect(left = vintageBandEndPx) { this@drawWithContent.drawContent() }
+                    } else Modifier
+                )
+            }
+
+            // 底部：指示器（控制栏已移除）
+            ThemeIndicator(
+                themes = VisualizerTheme.selectable(photoWallAvailable),
+                current = theme,
+                quality = quality,
+                onLightBg = isVintageTv,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+
+            Spacer(Modifier.size(24.dp))
+        }
+
+        // 右上：帧率读数（真机验收用，⛔ 默认关闭 ⇒ 常驻 UI 上不可见）
+        if (showFps) {
+            FpsBadge(
+                fps = fpsValue,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 12.dp, end = 20.dp)
+            )
+        }
+
+        // 左上（仅手机）：返回按钮
+        //
+        // ⛔ v2.36.2：**不能用 `androidx.tv.material3.IconButton`**（真机反馈「看得见、按不动」）。
+        // 它的 `Surface(onClick=)` 走 `Modifier.tvClickable`，而该实现**故意不挂 `Modifier.clickable`**
+        // —— `Surface.kt` 原注释：「We are not using "clickable" modifier here because if we set
+        // "enabled" to false then the Surface won't be focusable as well. But, in TV use case, a
+        // disabled surface should be focusable」—— 它只提供
+        //   ① `handleDPadEnter`：**D-Pad 按键**事件
+        //   ② `focusable()`：焦点
+        //   ③ `semantics { onClick { } }`：**无障碍服务**专用
+        // ⇒ **触摸点击永远不会触发 `onClick`**。TV 端本分支不渲染（`isTV` 为 true 时整块跳过），
+        //   所以只影响手机；必须改用项目自建的 [FocusableSurface]（内部是 `combinedClickable`，
+        //   触摸 / D-Pad 双通道），这也是全项目唯一一处 tv-material3 `IconButton`。
+        if (!isTV) {
+            FocusableSurface(
+                onClick = onExit,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(16.dp)
+                    // 48dp 在竖屏只有 ≈39.4 物理 dp ❌ → §2.7 换算抬到 56dp
+                    .size(portraitTouchTarget(48.dp))
+                    .semantics { contentDescription = backDescription },
+                shape = RoundedCornerShape(12.dp),
+                // 覆盖在频谱上：半透明黑底 + 白图标，保证任意主题下都看得清
+                containerColor = Color.Black.copy(alpha = 0.35f),
+                focusedContainerColor = Color.Black.copy(alpha = 0.55f),
+                // 手机没有焦点边框，按下高亮是唯一的"已响应"视觉反馈（同 PhoneTopBarIconButton）
+                pressedContainerColor = Color.White.copy(alpha = 0.25f),
+                contentColor = Color.White,
+                focusedContentColor = Color.White,
+                focusedScale = 1.08f,
+                pressedScale = 0.92f,
+                showFocusBorder = false,
+            ) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Filled.Close,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 交叉淡入下限：低于此值直接跳过绘制（省掉全透明帧的空跑） */
+private const val ALPHA_EPS = 0.004f
+
+/** 顶部歌词行 —— 脱离频谱刷新作用域，仅在行变化时重组 */
+@Composable
+private fun LyricTopBar(
+    lyrics: List<LyricsLine>?,
+    progressMs: Long,
+    fallback: String?,
+    modifier: Modifier = Modifier
+) {
+    // 二分查找本身 O(log n)，无需 derivedStateOf：
+    // 原写法把 progressMs 放进 remember key，每帧重建 State 对象，等于没缓存。
+    val index = findCurrentLyricLine(lyrics, progressMs)
+
+    val text = when {
+        lyrics.isNullOrEmpty() -> fallback ?: ""
+        index < 0 -> fallback ?: ""
+        else -> lyrics[index].text
+    }
+    if (text.isBlank()) return
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Text(
+            text = text,
+            color = Color.White,
+            fontSize = 28.sp,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            modifier = Modifier
+                // drawBehind 画圆角矩形：避免 RoundedCornerShape clip 触发
+                // Android 5.1 hwui Region 段错误（见 ThemeIndicator 注释）
+                .drawBehind {
+                    drawRoundRect(
+                        color = Color.Black.copy(alpha = 0.35f),
+                        cornerRadius = CornerRadius(8.dp.toPx())
+                    )
+                }
+                .padding(horizontal = 24.dp, vertical = 6.dp)
+        )
+    }
+}
+
+/**
+ * 查找当前应显示的歌词行索引（二分，避免长歌词逐帧 O(n)）。
+ * 返回最后一个 time <= 进度 的行；全部早于进度返回 -1。
+ */
+internal fun findCurrentLyricLine(lines: List<LyricsLine>?, progressMs: Long): Int {
+    if (lines.isNullOrEmpty()) return -1
+    var lo = 0
+    var hi = lines.lastIndex
+    var result = -1
+    while (lo <= hi) {
+        val mid = (lo + hi) ushr 1
+        if (lines[mid].time <= progressMs) {
+            result = mid
+            lo = mid + 1
+        } else hi = mid - 1
+    }
+    return result
+}
+
+/** 当前歌词行信息（给 E23 歌词点阵用） */
+internal data class LyricInfo(
+    val line: String?,
+    val nextLine: String?,
+    val progress: Float,
+    val hasWords: Boolean,
+    val lineIndex: Int,
+    val wordStartTimes: List<Long>,
+    val maxLineChars: Int = 0,
+    val longestLine: String? = null
+)
+
+/**
+ * 计算当前歌词行、行内进度、是否有逐字时间戳。
+ * 用于 E23 歌词点阵效果的逐字点亮动画。
+ */
+/** 整曲歌词级常量：只随歌词内容变化，与播放进度无关 */
+internal data class LyricMetrics(val maxChars: Int, val longest: String?)
+
+/**
+ * 汇总整曲歌词的最长句（E23 自适应字号用）。
+ * 为 O(N) 全量扫描，必须由调用方缓存，不能每帧调用。
+ */
+internal fun computeLyricMetrics(lines: List<LyricsLine>?): LyricMetrics {
+    if (lines.isNullOrEmpty()) return LyricMetrics(0, null)
+    var maxChars = 0
+    var longest: String? = null
+    for (l in lines) {
+        val len = l.text?.length ?: 0
+        if (len > maxChars) {
+            maxChars = len
+            longest = l.text
+        }
+    }
+    return LyricMetrics(maxChars, longest)
+}
+
+/**
+ * 计算当前歌词行、行内进度、是否有逐字时间戳。
+ * 用于 E23 歌词点阵效果的逐字点亮动画。
+ *
+ * @param metrics 整曲常量（由 computeLyricMetrics 缓存），避免每帧重算
+ */
+internal fun computeLyricInfo(
+    lines: List<LyricsLine>?,
+    progressMs: Long,
+    metrics: LyricMetrics = LyricMetrics(0, null)
+): LyricInfo {
+    if (lines.isNullOrEmpty()) return LyricInfo(null, null, 0f, false, -1, emptyList())
+    val idx = findCurrentLyricLine(lines, progressMs)
+    if (idx < 0) return LyricInfo(null, null, 0f, false, -1, emptyList())
+    val current = lines[idx]
+    val next = lines.getOrNull(idx + 1)
+    val duration = (next?.time ?: current.time + 3000L) - current.time
+    val elapsed = progressMs - current.time
+    val progress = if (duration > 0) (elapsed.toFloat() / duration).coerceIn(0f, 1f) else 1f
+    val hasWords = !current.wordTimestamps.isNullOrEmpty()
+    val wordStarts = current.wordTimestamps.map { it.startMs - current.time }
+    return LyricInfo(
+        current.text, next?.text, progress, hasWords, idx, wordStarts,
+        metrics.maxChars, metrics.longest ?: current.text
+    )
+}
+
+/**
+ * 右上角帧率读数（真机验收用）。
+ *
+ * 单独成 `@Composable` ⇒ 2 Hz 的 State 写入只重组这一个节点，不带着整个前景层重算。
+ * 底色用 `drawBehind` 画圆角矩形，⛔ 不用 `RoundedCornerShape` clip（同 Toast 的理由：
+ * Android 5.1 的 hwui Region 路径会段错误）。
+ */
+@Composable
+private fun FpsBadge(fps: FloatState, modifier: Modifier = Modifier) {
+    val v = fps.floatValue
+    Text(
+        text = if (v <= 0f) "-- fps" else "${(v * 10).toInt() / 10f} fps",
+        color = Color(0xFF9BFFB4),
+        fontSize = 12.sp,
+        maxLines = 1,
+        modifier = modifier
+            .drawBehind {
+                drawRoundRect(
+                    color = Color.Black.copy(alpha = 0.45f),
+                    cornerRadius = CornerRadius(6.dp.toPx())
+                )
+            }
+            .padding(horizontal = 8.dp, vertical = 3.dp)
+    )
+}
+
+/** 左下角歌曲信息（歌曲名 + 艺术家）；颜色/裁剪由调用方传入（怀旧反色模式双层绘制） */
+@Composable
+private fun SongInfoTexts(
+    song: Song?,
+    titleColor: Color,
+    artistColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier) {
+        Text(
+            text = song?.title ?: "",
+            color = titleColor,
+            fontSize = 24.sp,
+            maxLines = 1
+        )
+        Text(
+            text = song?.artist ?: "",
+            color = artistColor,
+            fontSize = 16.sp,
+            maxLines = 1
+        )
+    }
+}
+
+/** 底部圆点指示器（含 AUTO 档） */
+@Composable
+private fun ThemeIndicator(
+    themes: List<VisualizerTheme>,
+    current: VisualizerTheme,
+    quality: VisualQuality,
+    onLightBg: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    // 圆点用 Canvas drawCircle 绘制，而非 21 个 CircleShape clip：
+    // Android 5.1 (创维 rtd299o) 的 hwui Region::createTJunctionFreeRegion 对
+    // 大量圆形 clip 的拓扑合并存在段错误（RenderThread SIGSEGV，真机三次复现）。
+    // drawCircle 是普通绘制指令，不产生 RenderNode clip region。
+    val density = LocalDensity.current
+    val spacingDp = 17.dp
+    val radiusDp = 5.dp
+    val smallRadiusDp = 3.5.dp
+    val totalWidthDp = (themes.size - 1).coerceAtLeast(0) * spacingDp.value + 2 * radiusDp.value
+    Canvas(
+        modifier = modifier
+            .padding(vertical = 10.dp)
+            .size(totalWidthDp.dp, 10.dp)
+    ) {
+        val cx0 = radiusDp.toPx()
+        val cy = size.height / 2
+        themes.forEachIndexed { i, t ->
+            val supported = quality.supports(t)
+            val active = t == current
+            drawCircle(
+                color = when {
+                    // 浅底（怀旧黄白）上白点不可见 → 换深色点
+                    !supported -> if (onLightBg) Color.Black.copy(alpha = 0.22f)
+                    else Color.White.copy(alpha = 0.18f)
+                    active -> NasMusicColors.Primary
+                    else -> if (onLightBg) Color.Black.copy(alpha = 0.45f)
+                    else Color.White.copy(alpha = 0.42f)
+                },
+                radius = if (active) radiusDp.toPx() else smallRadiusDp.toPx(),
+                center = Offset(cx0 + i * spacingDp.toPx(), cy)
+            )
+        }
+    }
+}

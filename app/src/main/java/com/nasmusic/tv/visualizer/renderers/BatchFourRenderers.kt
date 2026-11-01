@@ -1,0 +1,1890 @@
+package com.nasmusic.tv.visualizer.renderers
+
+import android.graphics.Bitmap
+import android.os.SystemClock
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import com.nasmusic.tv.data.model.VisualQuality
+import com.nasmusic.tv.data.model.VisualizerTheme
+import com.nasmusic.tv.visualizer.AudioFrame
+import com.nasmusic.tv.visualizer.RenderContext
+import com.nasmusic.tv.visualizer.VisualizerRandom
+import com.nasmusic.tv.visualizer.VisualizerMath
+import com.nasmusic.tv.visualizer.VisualizerRenderer
+import com.nasmusic.tv.visualizer.fx.ProceduralTexture
+import com.nasmusic.tv.visualizer.fx.Shading2D
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/**
+ * E33 `CONCENTRIC_GEARS` — 同心齿轮系（主组 13 轮 · 三级啮合链 · 随机布局 + 卫星组）
+ *
+ * 视觉：暗金 + 冷灰线框齿轮系，每个啮合节点上有一粒青色电火花——机械钟表
+ * 质感带一点电流感。布局按**恒定模数**（MODULE = 0.024 世界单位/齿）构造三级
+ * 啮合链：中心轮（26–34T 随机）→ 内圈 5 轮（12–18T 随机）→ 外圈 7 轮（8–13T 随机）。
+ * 齿数 ∝ 节圆半径，任意啮合副齿距一致，中心距 = rp_a + rp_b + 齿隙（0.5×模数），
+ * 因此齿/槽在接触点恒定交错。
+ *
+ * **随机主组（onEnter 换种子 ⇒ 每次进效果一套全新布局；尺寸变化只换 unit、不重掷）**：
+ * 齿数、外圈父轮挂载（每个内圈保底 1 个子轮、其余随机撒后再洗牌）、安装角全部由
+ * 布局 LCG 生成。安装角只能落在**父轮齿中心栅格**上（这是接触点相位标定的前提），
+ * 每个候选槽位都做**兄弟碰撞检查** —— 两子轮中心距 ≥ tip₁+tip₂+齿隙（等价于
+ * cos 定理给出的角间隙），外加 reach 上限；单轮 ≤ `PLACE_RETRY`(32) 次重试，
+ * 仍失败则走确定性兜底（齿数从区间下限逐档降到 6T × 父轮全栅格扫描，取余量最大的
+ * 槽位；原父轮仍放不下时改挂中心轮 / 内圈的稳定槽位）⇒ 不规则的有机感，但绝不穿透、
+ * 绝不越界。
+ *
+ * 运动学（唯一驱动角 `mainAngle`，其余全部由齿数比推导）：
+ * ```
+ * angle_i = phase_i + ratio_i · mainAngle
+ * ratio_i = (±) N_center / N_i   符号 = 外啮合次数奇偶（链深 1→反向、2→同向）
+ * phase_i = mod step_i (β_i + π) β_i = 父轮指向该轮的安装角（接触点落齿槽中心）
+ * ```
+ * 相位按接触点标定、速比按齿数锁定 ⇒ **啮合相位永不漂移**。`mainAngle` 只有
+ * 两路合成，且**必须分开累加**：匀速基线 = `BASE_SPEED·elapsed` 绝对求值
+ * （TAU/56 ≈ 6.4°/s，帧帧恒正推进、不回退）+ 鼓点棘轮（pulse 上升沿推进一个
+ * 中心齿距，120ms 缓动到位；缓动只作用在棘轮**自己的**累加器上、只加不减）。
+ * ⛔ 绝不能把棘轮弹簧直接加在含基线的 `mainAngle` 上 —— `ratchetTarget` 里没有
+ * 基线，弹簧会把基线每帧减回去，整组在鼓点之间冻成静止（只在鼓点跳一齿）。
+ * 子轮没有任何独立调速，整链刚性跟随。`elapsed` 由**渲染时钟**
+ * （`SystemClock.uptimeMillis` 逐帧差分）推进，⛔ 不读 `ctx.nowMs` —— 后者是
+ * 25Hz 分析线程取样的 `f.timeMs`，暂停/PCM 停摆时冻结会让整组停转。
+ *
+ * **卫星组（独立小齿轮组，不与主组相接、不共用 mainAngle）**：随机散布在主组外围
+ * 空域，组数随档位 LOW 1 / MED 2 / HIGH 4，组内 1–3 齿（模数 SAT_MODULE 0.016，
+ * 齿数 6–11）。组内 ≥2 齿复用主组同一套啮合数学（中心距 = rp_a+rp_b+齿隙、
+ * 相位标定、速比 = (±)N锚/N齿 ⇒ 反向传动），驱动角却是**组自己的 ω·elapsed**：
+ * 纯 elapsed 连续转、**永不停止**（不接棘轮、不接 mainAngle）。每组圈速 20–90s，
+ * 两两差 ≥8s 且避开主组 56s ⇒ 各组速率互不相同。锚点与组内成员、组↔组、组↔主组、
+ * 组↔表圈全部做 tip 圆碰撞检查（+ 齿隙）。
+ *
+ * 分档只**裁剪外圈尾部**（外圈生成后按齿数降序 ⇒ 永远先砍最小的外围轮；父轮恒为
+ * 中心/内圈，即索引 0–5、永不参与该排序 ⇒ 裁剪后父子索引依然有效）：LOW 8 / MED 11 /
+ * HIGH 13 主组齿轮，卫星组
+ * LOW 1 / MED 2 / HIGH 4 组；布局本身不变 ⇒ 降档无几何跳变（不再要求对径对称）。
+ *
+ * 适配（FIT_K 0.43 / WORLD_EXTENT 1.06 / 峰值呼吸 ×1.05）：世界预算
+ * `max_world = 0.9×1.06 / (2×0.43×1.05) ≈ 1.0565`。为此主组世界坐标整体 **×0.70**
+ * 收缩（原 reach 1.0420 → ≤0.74；等比 ⇒ 中心距/齿隙/相位/速比同比，啮合数学一行
+ * 未动），腾出的卫星带半径 0.78–1.038（齿顶不越表圈 1.05，表圈留作外框）。
+ * 1080p 短边（半短边 540px，unit = 438.1px）静态→峰值：主组 60.0%→63.0%、
+ * 卫星 ≤84.2%→88.4%、表圈 85.2%→89.4%（89.4% 即全图最外缘）⇒ 均 ≤ 90% 安全线；
+ * 横竖屏 minDim 同值 ⇒ 两向同数，4K 等比（百分比与分辨率无关）。
+ *
+ * ## 纹理层（自底向上，绘制顺序即此顺序）
+ * 1. **背景空间感**（整屏底层，画在整组缩放之外，全按屏幕尺寸计算）：近黑基底
+ *    `#020306` → 中心 `#0B0E15` 极淡径向纵深 → 暗角 vignette（半对角线为半径、
+ *    四角 α0.55，纯径向渐变，⛔ 无模糊）→ 颗粒 grain（128/256px 预渲染 tile 位图
+ *    `drawImage` 平铺，LOW 省略）→ 固定种子星点（缓慢椭圆漂移、全局微脉动）。
+ * 2. **光层**：环境光晕（齿轮群外围一圈径向渐变环）→ 表圈刻度 → 节圆导引 →
+ *    **啮合父子轮中心连线**（最弱档，画在齿轮层之前）→ 齿内径向渐变填充 →
+ *    **双层描边**（外层宽而淡的金色光晕 + 内层亮金细线）→ 轴毂/辐条 →
+ *    **轴心核心光晕**（2 层渐隐同心圆 + 原脉动点，中心轮最亮、向外递减）→ 火花。
+ *
+ * 性能红线：draw 内零分配。**缓存点**（onEnter / 尺寸变化时建，draw 只读）：
+ * 齿廓顶点（主组 13 + 卫星 ≤9）、背景三 Brush（纵深/暗角/环境光）+ 齿内填充 Brush
+ * （容量 22 = 13 主组 + 9 卫星）、颗粒 tile 位图、5 个 Stroke（含双层描边外遍）、
+ * `gearPath`、星点 FloatArray×5、**布局数组（含 `gearAngVel`）与卫星布局**。
+ * ⛔ 布局 LCG（`lr`/`li`）**只在 onEnter 调用**，draw 内一次都不会碰；尺寸变化只重建
+ * Brush（`ensureLayout`），不重掷布局、不重置 elapsed/相位/平滑。整组能量
+ * 缩放走 `canvas.save/translate/scale/restore`（原生变换，零分配）—— **坐标与
+ * 运动学一行未动**，路径与齿内填充 Brush 同处该变换内 ⇒ 两者恒对齐。齿廓顶点
+ * onEnter 预生成（5 点/齿：root@0.00/0.22、tip@0.36/0.64、root@0.78 ⇒ 齿槽跨
+ * 0.78→1.22，横向余量经 backlash 核验），每帧手算世界坐标烘焙旋转（绝不用
+ * withTransform({ rotate })——其默认 pivot=画布中心，会让所有齿轮绕同一固定点
+ * 公转）。卫星组的自转角 = `phase + angVel·elapsed`（线性、无缓动、无上限 ⇒ 恒速连续；
+ * 与主组基线**共用同一个 `elapsed` 时间基**，同一 dt 钳位、同一归零时机）。
+ */
+class ConcentricGearsRenderer : VisualizerRenderer {
+
+    override val theme = VisualizerTheme.CONCENTRIC_GEARS
+
+    private companion object {
+        const val TAU = (2 * Math.PI).toFloat()
+        const val MODULE = 0.024f              // 模数（世界单位/齿）
+        const val MESH_CLEAR = MODULE * 0.5f   // 齿隙 = 0.012
+        const val DEPTH_CAP = MODULE * 1.05f   // 齿厚（单侧）上限 = 0.0252
+        const val ROOT_REL = 0.16f             // 小齿齿厚 ≤ 0.16·rp（防细齿）
+        const val WORLD_EXTENT = 1.06f         // 世界半径（适配分母，见 KDoc）
+        const val FIT_K = 0.43f                // unit = 0.43·minDim / 1.06（峰值×1.05 ⇒ 89.4% 半短边）
+        const val RATCHET_MS = 120f            // 棘轮缓动时长
+        const val RATCHET_THRESH = 0.18f       // pulse 上升沿阈值
+        const val MAIN_PERIOD = 56f           // 主组基线圈速（s/圈）—— 卫星圈速要避开它
+        const val BASE_SPEED = TAU / MAIN_PERIOD // 匀速基线：56s/圈 ≈ 0.112 rad/s
+        const val SMOOTH = 0.20f               // 音频平滑系数
+
+        // ── 背景空间感（整屏底层；全按屏幕尺寸计算，画在整组缩放之外）──────
+        const val BG_BASE = 0xFF020306L        // ① 近黑基底
+        const val BG_CORE = 0xFF0B0E15L        // ② 中心深灰蓝（极淡，视觉聚焦/纵深）
+        const val BG_CENTER_STOP = 0.40f       // 中心色平台（占半对角线比例）
+        const val VIG_START = 0.50f            // ③ 暗角起始半径（占半对角线比例）
+        const val VIG_EDGE_ALPHA = 0.55f       //    暗角最外 α（四角最深）
+        const val GRAIN_TILE = 128             // ④ 颗粒 tile 边长 px（短边 <1440）
+        const val GRAIN_TILE_HI = 256          //    4K：tile 放大 ⇒ 平铺 call 数恒 ≈135
+        const val GRAIN_TILE_LARGE_MIN = 1440f //    判 4K 的短边阈值
+        const val GRAIN_ALPHA_MED = 0.045f     //    颗粒整体 α（MED）
+        const val GRAIN_ALPHA_HIGH = 0.060f    //    颗粒整体 α（HIGH；LOW 省略）
+        const val STAR_MAX = 110               // ⑤ 星点数组上限
+        const val STAR_DRIFT = 0.012f          //    漂移幅度（归一化屏幅，缓）
+        const val STAR_DRIFT_PERIOD = 41f      //    漂移周期 s
+        const val STAR_PULSE_PERIOD = 13f      //    全局微脉动周期 s
+
+        // ── energy → 整组缩放 / 发光总强度（独立小 α EMA，慢于 SMOOTH）─────
+        const val SCALE_EMA = 0.06f            // groupEnergy 的平滑系数（红线要求 ≈0.06）
+        const val SCALE_BASE = 0.990f          // 缩放中值（静音时呼吸中心）
+        const val SCALE_BREATH = 0.010f        // 基础呼吸幅度（静音也保持极缓呼吸）
+        const val SCALE_BREATH_PERIOD = 9f     // 呼吸周期 s
+        const val SCALE_ENERGY_GAIN = 0.050f   // energy → 缩放增益
+        const val SCALE_MIN = 0.98f            // 缩放下限
+        const val SCALE_MAX = 1.05f            // 缩放上限
+        const val GLOW_GAIN_BASE = 0.85f       // 发光总强度 = base + gain·groupEnergy
+        const val GLOW_GAIN_ENERGY = 0.55f
+        const val GLOW_GAIN_MAX = 1.40f
+        const val GLOW_STROKE_BASE = 0.10f     // 外层光晕描边：静态基础 α
+        const val GLOW_STROKE_ENERGY = 0.17f   //                     + energy 缓升
+        const val GLOW_STROKE_MAX = 0.30f
+        const val GLOW_STROKE_W = 4.6f         // 外层光晕描边宽 px（内层仍 1.6/2.2）
+        const val AMBIENT_ALPHA_BASE = 0.055f  // 环境光晕 α：静态基础
+        const val AMBIENT_ALPHA_ENERGY = 0.075f//                     + energy 缓升
+        const val AMBIENT_ALPHA_MAX = 0.135f
+        const val AMBIENT_RADIUS = 1.45f       // 环境光半径 × unit（齿轮群外圈）
+        const val AMBIENT_INNER = 0.55f        // 渐变内侧透明截止（半径占比，避免糊住中心）
+        const val AMBIENT_PEAK = 0.78f         // 渐变峰值（≈ 齿轮群外缘 1.13·unit）
+        const val LINK_ALPHA_BASE = 0.045f     // 啮合连线 α：全层**最弱档**
+        const val LINK_ALPHA_ENERGY = 0.085f
+        const val LINK_ALPHA_MAX = 0.14f
+        const val FILL_CENTER_ALPHA = 0.16f    // 齿内填充：中心 α（边缘 0）
+        const val FILL_MID_ALPHA = 0.07f       //                中途 α
+        const val FILL_MID_STOP = 0.55f        //                中途位置
+        const val CORE_RING_ALPHA_OUT = 0.055f // 核心光晕外层 α（× ringBoost × glowGain）
+        const val CORE_RING_ALPHA_IN = 0.115f  // 核心光晕内层 α
+        const val CORE_RING_R_OUT = 4.6f       // 核心光晕外层半径 × 脉动点半径
+        const val CORE_RING_R_IN = 2.4f        // 核心光晕内层半径 × 脉动点半径
+
+        // ── 主组规模 + 随机生成（布局每次 onEnter 重掷；索引顺序 = 绘制顺序 =
+        //    降档裁剪顺序：0 中心 / 1–5 内圈 / 6–12 外圈（外圈按齿数降序））──────
+        const val N_MAIN = 13                // 主组固定 13 轮（中心 1 + 内圈 5 + 外圈 7）
+        const val N_INNER = 5
+        const val N_OUTER = 7
+        const val CENTER_TEETH_MIN = 26      // 中心轮齿数区间（原固定 30T）
+        const val CENTER_TEETH_MAX = 34
+        const val INNER_TEETH_MIN = 12       // 内圈齿数区间（原固定 16/15/16/14/15T）
+        const val INNER_TEETH_MAX = 18
+        const val OUTER_TEETH_MIN = 8        // 外圈齿数区间（原固定 12..9T）
+        const val OUTER_TEETH_MAX = 13
+        const val PLACE_RETRY = 32           // 单轮随机重试上限（超限 → 确定性兜底）
+        const val FALLBACK_ABS_MIN = 6       // 兜底阶梯的齿数绝对下限（仅兜底路径用到）
+
+        // ── 构图：主组收缩 + 卫星带（fit 数学见类 KDoc）────────────────────
+        const val MAIN_SHRINK = 0.70f        // 主组世界坐标整体收缩系数（等比 ⇒ 啮合不变）
+        const val MAIN_REACH_MAX = 0.74f     // 主组收缩后最外 reach 上限（世界）
+        const val MAIN_REACH_RAW = MAIN_REACH_MAX / MAIN_SHRINK  // 生成期上限 ≈1.0571
+        const val BEZEL_R = 1.05f            // 表圈半径（世界；峰值 ×1.05 ⇒ 89.4% 半短边）
+        const val SAT_MODULE = 0.016f        // 卫星组模数（比主组细 ⇒ 独立小齿轮）
+        const val SAT_DEPTH_CAP = SAT_MODULE * 1.05f
+        const val SAT_TEETH_MIN = 6
+        const val SAT_TEETH_MAX = 11
+        const val SAT_R_MIN = 0.78f          // 卫星锚点/成员半径下限（> 主组 reach 0.74）
+        const val SAT_MAX_GEARS = 9          // 卫星齿轮总上限（数组容量余量）
+        const val SAT_RETRY = 32             // 卫星单轮重试上限（同 PLACE_RETRY 量级）
+        const val SAT_SCAN = 72              // 卫星兜底扫描的角步数
+        const val SAT_GROUP_LOW = 1          // 各档卫星**组数**
+        const val SAT_GROUP_MED = 2
+        const val SAT_GROUP_HIGH = 4
+        const val SAT_GEAR_CAP_LOW = 2       // 各档卫星**齿数**上限
+        const val SAT_GEAR_CAP_MED = 5
+        const val SAT_GEAR_CAP_HIGH = SAT_MAX_GEARS
+        const val SAT_GEAR_MAX_PER_GROUP = 3 // 单组齿数上限
+        const val SAT_PERIOD_MIN = 20f       // 卫星组圈速区间（s/圈，互不相同且不等于 56）
+        const val SAT_PERIOD_MAX = 90f
+        const val SAT_PERIOD_GAP = 8f        // 圈速最小间隔（s）
+        const val SAT_PERIOD_TRIES = 24      // 圈速抽样重试上限（超限 → 下表兜底）
+        /** 圈速兜底表（两两差 ≥8s 且均避开 56s；按需取用） */
+        val SAT_PERIOD_FALLBACK = floatArrayOf(31f, 47f, 68f, 84f)
+    }
+
+    // 暗金 + 冷灰 + 青色火花（固定配色，不用封面色——机械质感自成体系）
+    private val gold = Color(0xFFC9A227)
+    private val goldDim = Color(0xFF8A7418)
+    private val coldGray = Color(0xFF8B95A1)
+    private val cyanSpark = Color(0xFF54E0E6)
+    // 星点（固定种子 onEnter 生成；每 4 颗一颗偏蓝）
+    private val starWhite = Color(0xFF9FB4CC)
+    private val starBlue = Color(0xFF6E8AD6)
+
+    // draw 内复用的描边/路径（零分配红线：绝不在 draw 里 new）
+    private val strokeBezel = Stroke(1f)
+    private val strokeGear = Stroke(1.6f)
+    private val strokeGearFat = Stroke(2.2f)   // bass 强时的加粗档（量化切换，免分配）
+    private val strokeGlow = Stroke(GLOW_STROKE_W)  // 双层描边的外遍：宽而淡的光晕
+    private val strokeHub = Stroke(1.2f)
+    private val gearPath = Path()
+
+    // ── 背景 / 光层缓存（ensureLayout：仅画布尺寸变化时重建；draw 只读）──────
+    private var bgDepthBrush: Brush? = null    // ② 中心纵深径向渐变（基底之上）
+    private var vignetteBrush: Brush? = null   // ③ 暗角（整屏半对角线定界）
+    private var ambientBrush: Brush? = null    // 环境光晕：齿轮群外围径向渐变环
+    /** 齿内填充 Brush（容量 = N_MAIN 13 + 卫星 9；只画 [0, gearCount) ∪ [N_MAIN, …)） */
+    private val fillBrushes: Array<Brush?> = arrayOfNulls(N_MAIN + SAT_MAX_GEARS)
+    private var layoutW = -1f                  // 尺寸缓存键（-1 = 待建）
+    private var layoutH = -1f
+
+    // ── 颗粒 tile 位图（预渲染一次 → drawImage 平铺；LOW 不建、onExit 归还）────
+    private var grainBitmap: ImageBitmap? = null
+    private var grainTilePx = 0
+
+    // ── 星点（onEnter 固定种子 LCG 生成；x/y 归一化 0..1，之后永不重掷）────────
+    private val starX = FloatArray(STAR_MAX)
+    private val starY = FloatArray(STAR_MAX)
+    private val starR = FloatArray(STAR_MAX)
+    private val starA = FloatArray(STAR_MAX)
+    private val starPh = FloatArray(STAR_MAX)  // 漂移相位（每颗不同 ⇒ 漂移不同步）
+    private var starCount = 0
+    private var tier = 1                       // 0=LOW / 1=MED / 2=HIGH（onEnter 解析）
+
+    // ── 布局 LCG（⛔ 仅 onEnter 调用；draw 内绝不触碰 ⇒ 零分配红线不受影响）────
+    //    种子**时间派生**（VisualizerRandom.defaultSeed，与项目种子策略一致）。
+    //    ⛔ 绝不能用常量种子：切效果时 RendererSwapper.sync 走 `factory(theme)` 造**全新
+    //    实例**（离开舞台还会 release）⇒ 常量种子会让每次进效果都是同一套「随机」布局。
+    //    实例建好后每次 onEnter 再推进一次种子 ⇒ 同实例重入（切画质）也换新布局；
+    //    画布尺寸变化不走这里（只重建 Brush）。
+    private var lrng = VisualizerRandom.defaultSeed()
+
+    // ── 主组 + 卫星组布局（onEnter 计算，draw 只读）──────────────────────────
+    //    索引约定：[0, N_MAIN) = 主组（0 中心 / 1–5 内圈 / 6–12 外圈，外圈按齿数
+    //    降序 ⇒ 裁尾即砍最小齿）；[N_MAIN, N_MAIN+satCount) = 卫星组（锚轮在前）。
+    //    容量恒定 22，onEnter 只填充、不重分配。
+    private val gearTeeth = IntArray(N_MAIN + SAT_MAX_GEARS)
+    private val gearParent = IntArray(N_MAIN + SAT_MAX_GEARS)
+    private val gearRing = IntArray(N_MAIN + SAT_MAX_GEARS)
+    private val gearX = FloatArray(N_MAIN + SAT_MAX_GEARS)   // 安装中心（世界，屏心为原点）
+    private val gearY = FloatArray(N_MAIN + SAT_MAX_GEARS)
+    private val gearRp = FloatArray(N_MAIN + SAT_MAX_GEARS)  // 节圆半径
+    private val gearTip = FloatArray(N_MAIN + SAT_MAX_GEARS) // 齿顶半径
+    private val gearRoot = FloatArray(N_MAIN + SAT_MAX_GEARS)// 齿根半径
+    private val gearRatio = FloatArray(N_MAIN + SAT_MAX_GEARS) // ω 比（主组相对 mainAngle）
+    private val gearPhase = FloatArray(N_MAIN + SAT_MAX_GEARS) // 安装相位（接触点标定）
+    private val gearStep = FloatArray(N_MAIN + SAT_MAX_GEARS)  // 齿距角 = TAU / teeth
+    private val gearAngVel = FloatArray(N_MAIN + SAT_MAX_GEARS) // 卫星恒定角速度 ω（主组不用）
+    private val sparkX = FloatArray(N_MAIN + SAT_MAX_GEARS)  // 啮合节点（世界坐标，预计算）
+    private val sparkY = FloatArray(N_MAIN + SAT_MAX_GEARS)
+    private var gearVerts = mutableListOf<FloatArray>()  // 齿廓顶点（世界半径已烘焙）
+    private var orbit1R = 0f                // 内圈节圆导引半径（平均）
+    private var orbit2R = 0f                // 外圈节圆导引半径（平均）
+    private var gearCount = 0               // 主组当前档位绘制数（8 / 11 / 13）
+    private var satCount = 0                // 卫星齿轮数（0 / ≤2 / ≤5 / ≤9）；生成期随放置即时回写
+
+    private var mainAngle = 0f        // 唯一驱动角（绘制用；= 基线 BASE·elapsed + 棘轮分量）
+    private var ratchetAngle = 0f     // 棘轮缓动分量（独立累加：只加不减，⛔ 不碰基线）
+    private var ratchetTarget = 0f    // 棘轮目标角
+    private var lastPulse = 0f
+    private var lastMs = 0L
+    private var elapsed = 0f          // 进入后累计秒（只在 onEnter 归零）
+    private var bassS = 0f
+    private var midS = 0f
+    private var trebleS = 0f
+    private var energyS = 0f
+    /** energy 的第二级慢 EMA（α≈0.06）→ 整组缩放与发光总强度；尺寸变化不碰，只 onEnter 归零 */
+    private var groupEnergy = 0f
+
+    override fun onEnter(ctx: RenderContext) {
+        lastPulse = 0f
+        lastMs = 0L
+        elapsed = 0f
+        bassS = 0f
+        midS = 0f
+        trebleS = 0f
+        energyS = 0f
+        groupEnergy = 0f
+        mainAngle = 0f
+        ratchetAngle = 0f
+        ratchetTarget = 0f
+
+        // ⚠️ 画质变化时 RendererSwapper 会对**同一实例**重入 onEnter（不走 onExit）：
+        //    先还旧颗粒位图（API22-25 Bitmap 像素在 native 堆，仅靠 finalizer 延迟回收），
+        //    并把尺寸缓存键清成 -1 ⇒ 下一帧按当前尺寸重建全部 Brush / 颗粒 tile。
+        //    ⛔ 这条路径**不碰** elapsed / 相位 / 音频平滑（上方已按只在 onEnter 归零的
+        //    字段处理；尺寸变化本身更不会重置它们）。
+        releaseGrain()
+        layoutW = -1f
+        layoutH = -1f
+
+        // ── 分档：主组 LOW 8 / MED 11 / HIGH 13（裁外圈尾部；布局全量 13 轮不变）──
+        //    卫星组 LOW 1 / MED 2 / HIGH 4 组（见 buildSatellites）──
+        gearCount = when (ctx.quality) {
+            VisualQuality.LOW -> 8
+            VisualQuality.MEDIUM -> 11
+            else -> 13
+        }
+        // 装饰层分档（星点密度 / 颗粒）：齿轮数与它各自独立
+        tier = when (ctx.quality) {
+            VisualQuality.LOW -> 0
+            VisualQuality.MEDIUM -> 1
+            else -> 2
+        }
+
+        // ── 布局 RNG：每次 onEnter 先推进一次种子 ⇒ 每次进效果/切画质一套全新布局。
+        //    ⛔ 画布尺寸变化**不走这里**（只走 ensureLayout，仅换 unit）⇒ 布局世界坐标、
+        //    elapsed、相位、音频平滑全部原样保留（见下方 ensureLayout 的注释）。
+        lrng = lrng * 1664525u + 1013904223u
+        gearVerts = mutableListOf()
+        satCount = 0
+
+        // ── 中心轮：随机齿数（26–34T）──────────────────────────────────────
+        setGeom(0, li(CENTER_TEETH_MIN, CENTER_TEETH_MAX), MODULE, DEPTH_CAP)
+        gearParent[0] = -1
+        gearRing[0] = 0
+        gearRatio[0] = 1f
+        gearPhase[0] = 0f
+        gearX[0] = 0f
+        gearY[0] = 0f
+        sparkX[0] = 0f
+        sparkY[0] = 0f
+
+        // ── 内圈 5 轮：随机齿数（12–18T）× 随机安装角（中心轮齿栅格随机槽位）
+        //    兄弟碰撞检查 + reach 上限，≤ PLACE_RETRY 次重试 → fallbackMain ──
+        var i = 1
+        while (i <= N_INNER) {
+            gearParent[i] = 0
+            gearRing[i] = 1
+            placeMainGear(i, 0, INNER_TEETH_MIN, INNER_TEETH_MAX)
+            i++
+        }
+
+        // ── 外圈父轮：每个内圈保底 1 个子轮，其余随机撒 ⇒ 挂载结构也不对称 ──
+        val outerParent = IntArray(N_OUTER)
+        var k = 0
+        while (k < N_INNER) {
+            outerParent[k] = 1 + k
+            k++
+        }
+        while (k < N_OUTER) {
+            outerParent[k] = 1 + li(0, N_INNER - 1)
+            k++
+        }
+        k = N_OUTER - 1                       // Fisher–Yates 洗牌（子轮不按内圈排队）
+        while (k > 0) {
+            val jj = li(0, k)
+            val tmp = outerParent[k]
+            outerParent[k] = outerParent[jj]
+            outerParent[jj] = tmp
+            k--
+        }
+
+        // ── 外圈 7 轮：随机齿数（8–13T）× 随机父轮齿栅格槽位，逐槽碰撞 + reach ──
+        i = N_INNER + 1
+        while (i < N_MAIN) {
+            gearParent[i] = outerParent[i - (N_INNER + 1)]
+            gearRing[i] = 2
+            placeMainGear(i, gearParent[i], OUTER_TEETH_MIN, OUTER_TEETH_MAX)
+            i++
+        }
+
+        // ── 速比：ratio = (±) N_center/N_i，符号 = 链深奇偶（外啮合一次反一次）──
+        i = 1
+        while (i < N_MAIN) {
+            var d = 0
+            var p = gearParent[i]
+            while (p >= 0) {
+                p = gearParent[p]
+                d++
+            }
+            val r = gearTeeth[0].toFloat() / gearTeeth[i]
+            gearRatio[i] = if (d % 2 == 0) r else -r
+            i++
+        }
+
+        // ── 外圈按齿数降序（插入排序）：降档裁尾 ⇒ 永远先砍最小的外围轮；
+        //    父轮恒为中心/内圈（索引 0–5，**永不参与本排序**）⇒ 裁剪后父子索引依然
+        //    有效、位置不动 ⇒ 无几何跳变 ──
+        i = N_INNER + 2
+        while (i < N_MAIN) {
+            var b = i
+            while (b > N_INNER + 1 && gearTeeth[b] > gearTeeth[b - 1]) {
+                swapGear(b, b - 1)
+                b--
+            }
+            i++
+        }
+
+        // ── 主组整体收缩（等比 ⇒ 中心距/齿隙/相位/速比同比，啮合数学一行未动）──
+        //    腾出 0.74→0.78 之外的卫星带；reach 上限在生成期用 MAIN_REACH_RAW 把关。
+        i = 0
+        while (i < N_MAIN) {
+            gearX[i] *= MAIN_SHRINK
+            gearY[i] *= MAIN_SHRINK
+            gearRp[i] *= MAIN_SHRINK
+            gearTip[i] *= MAIN_SHRINK
+            gearRoot[i] *= MAIN_SHRINK
+            sparkX[i] *= MAIN_SHRINK
+            sparkY[i] *= MAIN_SHRINK
+            i++
+        }
+
+        // 节圆导引环：穿过内圈 / 外圈各轮心的平均半径（仅主组，卫星不参与）
+        var s1 = 0f
+        var c1 = 0
+        var s2 = 0f
+        var c2 = 0
+        i = 1
+        while (i < N_MAIN) {
+            val od = sqrt(gearX[i] * gearX[i] + gearY[i] * gearY[i])
+            if (gearRing[i] == 1) {
+                s1 += od; c1++
+            } else {
+                s2 += od; c2++
+            }
+            i++
+        }
+        orbit1R = if (c1 > 0) s1 / c1 else 0f
+        orbit2R = if (c2 > 0) s2 / c2 else 0f
+
+        // 齿廓顶点预生成（世界半径烘焙；5 点/齿，见类 KDoc）
+        i = 0
+        while (i < N_MAIN) {
+            gearVerts.add(buildGearVerts(gearTip[i], gearRoot[i], gearTeeth[i]))
+            i++
+        }
+
+        // ── 卫星组：主组外围的独立小组（世界坐标在此一次写定，尺寸变化不重掷）──
+        buildSatellites()
+
+        // ── 星野：固定种子 LCG 一次性生成，之后永不重掷（零闪烁；与太阳系同款）──
+        //    ⚠️ 本地 fun 捕获可变 rng ⇒ 仅 onEnter 分配一次（draw 内零分配不受影响）
+        var rng = 0x5EEDF00Du
+        fun nextRand(): Float {
+            rng = rng * 1664525u + 1013904223u
+            return (rng shr 8).toFloat() / 16777216f
+        }
+        var s = 0
+        while (s < STAR_MAX) {
+            // 四周留 0.03 余量 ⇒ 漂移 ±0.012 后仍不出屏
+            starX[s] = 0.03f + nextRand() * 0.94f
+            starY[s] = 0.03f + nextRand() * 0.94f
+            starR[s] = 0.0010f + nextRand() * 0.0018f   // × minDim ⇒ 1.1~3.0px@1080p
+            starA[s] = 0.14f + nextRand() * 0.26f        // 弱亮度 0.14..0.40
+            starPh[s] = nextRand() * TAU
+            s++
+        }
+        starCount = when (tier) {
+            0 -> 40
+            1 -> 70
+            else -> STAR_MAX
+        }
+    }
+
+    /** 退出：归还颗粒 tile 位图（可重复调用；纹理只此一处重资源） */
+    override fun onExit() {
+        releaseGrain()
+    }
+
+    // ══ 布局生成（⛔ 全部只在 onEnter 调用；draw 内零分配红线不受影响）════════
+
+    /** 布局 LCG 随机数 0..1（仅 onEnter 路径调用） */
+    private fun lr(): Float {
+        lrng = lrng * 1664525u + 1013904223u
+        return (lrng shr 8).toFloat() / 16777216f
+    }
+
+    /** 闭区间随机整数 [min, max]（仅 onEnter 路径调用） */
+    private fun li(min: Int, max: Int): Int {
+        if (max <= min) return min
+        val span = max - min + 1
+        return min + (lr() * span).toInt().coerceIn(0, span - 1)
+    }
+
+    /** 写入齿数派生量（节圆 / 齿顶 / 齿根 / 齿距）；模数不同 ⇒ 主组与卫星组分别传入 */
+    private fun setGeom(i: Int, teeth: Int, mod: Float, depthCap: Float) {
+        val rp = mod * teeth / 2f
+        val depth = minOf(depthCap, rp * ROOT_REL)
+        gearTeeth[i] = teeth
+        gearRp[i] = rp
+        gearTip[i] = rp + depth
+        gearRoot[i] = rp - depth
+        gearStep[i] = TAU / teeth
+    }
+
+    /**
+     * 与 [0, [upto]) 已放置齿轮的**最小余量**（>0 有间隙、=0 刚好贴合、<0 穿透）。
+     * 判据：中心距 ≥ tip₁ + tip₂ + 齿隙（两 tip 圆不相交）。
+     * ⚠️ [parent] 是啮合父轮 —— 中心距本就是 rp₁+rp₂+齿隙（< tip₁+tip₂+齿隙），
+     * 属于「必须啮合」而非「必须分开」，必须排除。
+     */
+    private fun clearanceTo(upto: Int, x: Float, y: Float, tip: Float, parent: Int): Float {
+        var best = Float.MAX_VALUE
+        var j = 0
+        while (j < upto) {
+            if (j != parent) {
+                val dx = x - gearX[j]
+                val dy = y - gearY[j]
+                val need = tip + gearTip[j] + MESH_CLEAR
+                val m = sqrt(dx * dx + dy * dy) - need
+                if (m < best) best = m
+            }
+            j++
+        }
+        return best
+    }
+
+    /**
+     * 卫星轮的余量检查：已画主组 [0, gearCount) + 已放卫星 [N_MAIN, N_MAIN+satCount)。
+     * [skip] = 自己的啮合父轮（组内锚点/上一齿），无父轮传 −1。
+     */
+    private fun satClearance(x: Float, y: Float, tip: Float, skip: Int): Float {
+        var best = clearanceTo(gearCount, x, y, tip, skip)
+        var j = N_MAIN
+        while (j < N_MAIN + satCount) {
+            if (j != skip) {
+                val dx = x - gearX[j]
+                val dy = y - gearY[j]
+                val need = tip + gearTip[j] + MESH_CLEAR
+                val m = sqrt(dx * dx + dy * dy) - need
+                if (m < best) best = m
+            }
+            j++
+        }
+        return best
+    }
+
+    /** 接触点标定 + 火花节点（主组 / 卫星组共用同一公式）：β = 父轮指向该轮的安装角 */
+    private fun finishMesh(i: Int, parent: Int, beta: Float) {
+        // 从本轮中心看接触方向 = β + π；相位把该方向对准齿槽中心（父轮侧则是齿中心）
+        val local = beta + TAU / 2f
+        val st = gearStep[i]
+        gearPhase[i] = local - st * floor(local / st)
+        sparkX[i] = gearX[parent] + cos(beta) * gearRp[parent]
+        sparkY[i] = gearY[parent] + sin(beta) * gearRp[parent]
+    }
+
+    /**
+     * 主组单轮放置：随机齿数 [teethLo, teethHi] × 随机**父轮齿中心栅格**槽位
+     * （栅格是接触点相位标定的前提，所以安装角只能从槽位里挑，不能连续取）。
+     * 每个候选做两道检查 —— ① 与全部已放置轮（父轮除外）的 tip 圆余量 ≥ 0；
+     * ② reach = |中心|+tip ≤ [MAIN_REACH_RAW]。≤ [PLACE_RETRY] 次随机重试，
+     * 全部落空则走确定性兜底 [fallbackMain]，最后标定相位与火花节点。
+     */
+    private fun placeMainGear(i: Int, parent: Int, teethLo: Int, teethHi: Int) {
+        var beta = 0f
+        var placed = false
+        var attempt = 0
+        while (!placed && attempt < PLACE_RETRY) {
+            setGeom(i, li(teethLo, teethHi), MODULE, DEPTH_CAP)
+            val c = gearRp[parent] + gearRp[i] + MESH_CLEAR   // 啮合中心距 = rp_a+rp_b+齿隙
+            val b = gearPhase[parent] + (li(0, gearTeeth[parent] - 1) + 0.5f) * gearStep[parent]
+            val x = gearX[parent] + cos(b) * c
+            val y = gearY[parent] + sin(b) * c
+            if (sqrt(x * x + y * y) + gearTip[i] <= MAIN_REACH_RAW &&
+                clearanceTo(i, x, y, gearTip[i], parent) >= 0f
+            ) {
+                beta = b
+                gearX[i] = x
+                gearY[i] = y
+                placed = true
+            }
+            attempt++
+        }
+        if (!placed) beta = fallbackMain(i, parent, teethLo)
+        finishMesh(i, gearParent[i], beta)   // 兜底可能改挂父轮 ⇒ 以 gearParent 为准
+    }
+
+    /**
+     * 主组确定性兜底：先按**原父轮**把齿数从 [teethLo] 逐档降到 [FALLBACK_ABS_MIN]、
+     * 每档扫父轮**全部齿槽**，取「碰撞余量 ∧ reach 余量」最大的槽位；原父轮全放不下时，
+     * 再依次改挂到中心轮 / 任一内圈（索引 0–N_INNER ⇒ **恒不参与外圈重排**，改挂不会
+     * 让 swapGear 的父指针失效）。任一档余量 ≥0 即停。
+     * 返回安装角 β，并写入本轮几何、位置与 [gearParent]（兜底可能改挂）。
+     *
+     * ⚠️ 实测（logs_temp/gears_layout_check_v2.py，3 档 × 400 种子 = 1200 布局 / 14400 轮）：
+     * 随机重试成功率 97.7%（兜底 333 次，其中改挂中心/内圈 40 次、降到区间下限以下
+     * 145 轮）；**负余量 = 0**、主组非啮合最小余量 +0.000068、reach ≤0.7399。
+     */
+    private fun fallbackMain(i: Int, parent: Int, teethLo: Int): Float {
+        var bestMargin = Float.NEGATIVE_INFINITY
+        var bestParent = parent
+        var bestTeeth = teethLo
+        var bestBeta = 0f
+        // 候选父轮：原父轮优先；外圈轮（索引 > N_INNER）可改挂中心轮/内圈，内圈轮恒挂中心
+        var ci = -1                                   // −1 = 原父轮，其后 0..N_INNER
+        while (ci <= N_INNER) {
+            val pi = if (ci < 0) parent else ci
+            val usable = ci < 0 || (i > N_INNER && pi != parent)
+            if (usable) {
+                var t = teethLo
+                while (t >= FALLBACK_ABS_MIN) {
+                    setGeom(i, t, MODULE, DEPTH_CAP)
+                    val c = gearRp[pi] + gearRp[i] + MESH_CLEAR
+                    val slots = gearTeeth[pi]
+                    var kk = 0
+                    while (kk < slots) {
+                        val b = gearPhase[pi] + (kk + 0.5f) * gearStep[pi]
+                        val x = gearX[pi] + cos(b) * c
+                        val y = gearY[pi] + sin(b) * c
+                        var m = clearanceTo(i, x, y, gearTip[i], pi)
+                        val reachSlack = MAIN_REACH_RAW - (sqrt(x * x + y * y) + gearTip[i])
+                        if (reachSlack < m) m = reachSlack
+                        if (m > bestMargin) {
+                            bestMargin = m
+                            bestParent = pi
+                            bestTeeth = t
+                            bestBeta = b
+                        }
+                        kk++
+                    }
+                    if (bestMargin >= 0f) break
+                    t--
+                }
+            }
+            if (bestMargin >= 0f) break
+            ci++
+        }
+        setGeom(i, bestTeeth, MODULE, DEPTH_CAP)
+        gearParent[i] = bestParent
+        val c = gearRp[bestParent] + gearRp[i] + MESH_CLEAR
+        gearX[i] = gearX[bestParent] + cos(bestBeta) * c
+        gearY[i] = gearY[bestParent] + sin(bestBeta) * c
+        return bestBeta
+    }
+
+    /** 交换两轮的全部布局字段（外圈按齿数降序的插入排序用；onEnter 内调用） */
+    private fun swapGear(a: Int, b: Int) {
+        var iv = gearTeeth[a]; gearTeeth[a] = gearTeeth[b]; gearTeeth[b] = iv
+        iv = gearParent[a]; gearParent[a] = gearParent[b]; gearParent[b] = iv
+        iv = gearRing[a]; gearRing[a] = gearRing[b]; gearRing[b] = iv
+        var fv = gearX[a]; gearX[a] = gearX[b]; gearX[b] = fv
+        fv = gearY[a]; gearY[a] = gearY[b]; gearY[b] = fv
+        fv = gearRp[a]; gearRp[a] = gearRp[b]; gearRp[b] = fv
+        fv = gearTip[a]; gearTip[a] = gearTip[b]; gearTip[b] = fv
+        fv = gearRoot[a]; gearRoot[a] = gearRoot[b]; gearRoot[b] = fv
+        fv = gearRatio[a]; gearRatio[a] = gearRatio[b]; gearRatio[b] = fv
+        fv = gearPhase[a]; gearPhase[a] = gearPhase[b]; gearPhase[b] = fv
+        fv = gearStep[a]; gearStep[a] = gearStep[b]; gearStep[b] = fv
+        fv = sparkX[a]; sparkX[a] = sparkX[b]; sparkX[b] = fv
+        fv = sparkY[a]; sparkY[a] = sparkY[b]; sparkY[b] = fv
+    }
+
+    /**
+     * 卫星组生成 —— 主组**外围**的独立小齿轮组（与主组零啮合、零接触）。
+     *
+     * - 组数随档位：LOW 1 / MED 2 / HIGH 4；组内 1–3 齿（总齿数 ≤ 档位上限）。
+     * - 锚轮：极坐标随机（半径 [SAT_R_MIN, 表圈−齿隙−tip]），≤ SAT_RETRY 次随机
+     *   抽样，失败转 72 角 × 3 半径全扫描取最大余量。
+     * - 组内成员：复用主组啮合数学（父轮齿栅格槽位 + 中心距 = rp_a+rp_b+齿隙 +
+     *   相位标定 + 速比 (±)N锚/N齿 ⇒ 反向/同向传动），但驱动角是**组自己的
+     *   ω·elapsed**：纯线性、无棘轮、无缓动 ⇒ 恒速连续、永不停止。
+     * - 碰撞：组↔组、组↔主组（当前档位绘制集）、组↔表圈全部 tip 圆 + 齿隙检查；
+     *   成员另受半径带 [SAT_R_MIN, 表圈−齿隙−tip] 约束。
+     * - 圈速：20–90s，彼此差 ≥8s 且避开主组 56s（超时走 [SAT_PERIOD_FALLBACK]）。
+     *
+     * 全部世界坐标在此一次写定 ⇒ 画布尺寸变化只换 unit，**不重掷、不重置相位**。
+     */
+    private fun buildSatellites() {
+        val groupCount = when (tier) {
+            0 -> SAT_GROUP_LOW
+            1 -> SAT_GROUP_MED
+            else -> SAT_GROUP_HIGH
+        }
+        val gearCap = when (tier) {
+            0 -> SAT_GEAR_CAP_LOW
+            1 -> SAT_GEAR_CAP_MED
+            else -> SAT_GEAR_CAP_HIGH
+        }
+
+        // 每组圈速（s/圈）：互不相同、也不同于主组 56s ⇒ 各组速率各不相同
+        val periods = FloatArray(groupCount)
+        var g = 0
+        while (g < groupCount) {
+            var ok = false
+            var t = 0
+            while (!ok && t < SAT_PERIOD_TRIES) {
+                val p = SAT_PERIOD_MIN + lr() * (SAT_PERIOD_MAX - SAT_PERIOD_MIN)
+                ok = abs(p - MAIN_PERIOD) >= SAT_PERIOD_GAP
+                var o = 0
+                while (ok && o < g) {
+                    if (abs(p - periods[o]) < SAT_PERIOD_GAP) ok = false
+                    o++
+                }
+                if (ok) periods[g] = p
+                t++
+            }
+            if (!ok) {
+                // 兜底 ①：固定表里挑一个对**已选圈速**也满足的（表自身两两差 ≥8s、避开 56s）
+                var idx = 0
+                while (!ok && idx < SAT_PERIOD_FALLBACK.size) {
+                    val p2 = SAT_PERIOD_FALLBACK[idx]
+                    if (abs(p2 - MAIN_PERIOD) >= SAT_PERIOD_GAP) {
+                        var hit = false
+                        var o = 0
+                        while (o < g) {
+                            if (abs(p2 - periods[o]) < SAT_PERIOD_GAP) hit = true
+                            o++
+                        }
+                        if (!hit) {
+                            periods[g] = p2
+                            ok = true
+                        }
+                    }
+                    idx++
+                }
+                // 兜底 ②：0.5s 步长全线扫描（窗口 70s、每选一个圈速封掉 16s ⇒ 必有空位）
+                var probe = SAT_PERIOD_MIN
+                while (!ok && probe <= SAT_PERIOD_MAX + 1e-3f) {
+                    if (abs(probe - MAIN_PERIOD) >= SAT_PERIOD_GAP) {
+                        var hit = false
+                        var o = 0
+                        while (o < g) {
+                            if (abs(probe - periods[o]) < SAT_PERIOD_GAP) hit = true
+                            o++
+                        }
+                        if (!hit) {
+                            periods[g] = probe
+                            ok = true
+                        }
+                    }
+                    probe += 0.5f
+                }
+                if (!ok) periods[g] = SAT_PERIOD_FALLBACK[g % SAT_PERIOD_FALLBACK.size] // 理论不可达
+            }
+            g++
+        }
+
+        var placed = 0
+        g = 0
+        while (g < groupCount && placed < gearCap) {
+            // 组驱动角 ω：符号随机 ⇒ 有的顺时针有的逆时针，幅值 = TAU/圈速
+            val omega = (if (lr() < 0.5f) -1f else 1f) * TAU / periods[g]
+            val want = li(1, minOf(SAT_GEAR_MAX_PER_GROUP, gearCap - placed))
+
+            // ── 锚轮（组内第 0 齿）：极坐标随机散布 ──
+            val lead = N_MAIN + placed
+            var lx = 0f
+            var ly = 0f
+            var ok = false
+            var attempt = 0
+            while (!ok && attempt < SAT_RETRY) {
+                setGeom(lead, li(SAT_TEETH_MIN, SAT_TEETH_MAX), SAT_MODULE, SAT_DEPTH_CAP)
+                val tip = gearTip[lead]
+                val rMax = BEZEL_R - MESH_CLEAR - tip
+                if (rMax > SAT_R_MIN) {
+                    val r = SAT_R_MIN + lr() * (rMax - SAT_R_MIN)
+                    val th = lr() * TAU
+                    val x = cos(th) * r
+                    val y = sin(th) * r
+                    if (satClearance(x, y, tip, -1) >= 0f) {
+                        lx = x
+                        ly = y
+                        ok = true
+                    }
+                }
+                attempt++
+            }
+            if (!ok) {
+                // 兜底：3 条半径 × SAT_SCAN 个方向全扫描，取余量最大的落点
+                setGeom(lead, SAT_TEETH_MIN, SAT_MODULE, SAT_DEPTH_CAP)
+                val tip = gearTip[lead]
+                val rLo = SAT_R_MIN + 0.02f
+                val rHi = (BEZEL_R - MESH_CLEAR - tip - 0.02f).coerceAtLeast(rLo)
+                var bestM = Float.NEGATIVE_INFINITY
+                var ri = 0
+                while (ri < 3) {
+                    val r = rLo + (rHi - rLo) * ri * 0.5f
+                    var a2 = 0
+                    while (a2 < SAT_SCAN) {
+                        val th = a2 * TAU / SAT_SCAN
+                        val x = cos(th) * r
+                        val y = sin(th) * r
+                        val m = satClearance(x, y, tip, -1)
+                        if (m > bestM) {
+                            bestM = m
+                            lx = x
+                            ly = y
+                        }
+                        a2++
+                    }
+                    ri++
+                }
+            }
+            gearX[lead] = lx
+            gearY[lead] = ly
+            gearParent[lead] = lead        // 锚轮自指 ⇒ 无啮合父轮（火花循环据此跳过）
+            gearRing[lead] = 2
+            gearRatio[lead] = 1f           // 组内速比以锚轮为基准
+            gearPhase[lead] = 0f
+            gearAngVel[lead] = omega       // 锚轮 = 组驱动轮：ω·elapsed，恒速永不停
+            sparkX[lead] = 0f
+            sparkY[lead] = 0f
+            gearVerts.add(buildGearVerts(gearTip[lead], gearRoot[lead], gearTeeth[lead]))
+            placed++
+            // ⚠️ 必须即时回写：satClearance 的卫星段读的是 satCount（不是局部 placed）。
+            //    只在函数末尾回写一次 ⇒ 锚轮/成员放置期间卫星段恒为空 ⇒ KDoc 承诺的
+            //    「组↔组 / 组内非父轮 tip 圆碰撞检查」会静默失效（验证脚本按增量列表
+            //    建模，测不出这个差异）。
+            satCount = placed
+
+            // ── 组内后续齿：链式啮合（锚 → 齿1 → 齿2），速比 = (±)N锚/N齿 ──
+            var parent = lead
+            var mi = 1
+            while (mi < want && placed < gearCap) {
+                val idx = N_MAIN + placed
+                var beta = 0f
+                var okM = false
+                var att = 0
+                while (!okM && att < SAT_RETRY) {
+                    setGeom(idx, li(SAT_TEETH_MIN, SAT_TEETH_MAX), SAT_MODULE, SAT_DEPTH_CAP)
+                    val c = gearRp[parent] + gearRp[idx] + MESH_CLEAR
+                    val b = gearPhase[parent] + (li(0, gearTeeth[parent] - 1) + 0.5f) *
+                        gearStep[parent]
+                    val x = gearX[parent] + cos(b) * c
+                    val y = gearY[parent] + sin(b) * c
+                    val rad = sqrt(x * x + y * y)
+                    if (rad >= SAT_R_MIN &&
+                        rad + gearTip[idx] <= BEZEL_R - MESH_CLEAR &&
+                        satClearance(x, y, gearTip[idx], parent) >= 0f
+                    ) {
+                        beta = b
+                        gearX[idx] = x
+                        gearY[idx] = y
+                        okM = true
+                    }
+                    att++
+                }
+                if (!okM) break   // 该方向放不下 ⇒ 本组到此为止（组仍有效，只是齿更少）
+                var depth = 1     // 组内链深（锚 = 0）：奇 ⇒ 反向、偶 ⇒ 同向
+                var pp = parent
+                while (gearParent[pp] != pp) {
+                    pp = gearParent[pp]
+                    depth++
+                }
+                val mag = gearTeeth[lead].toFloat() / gearTeeth[idx]
+                val ratio = if (depth % 2 == 1) -mag else mag
+                gearParent[idx] = parent
+                gearRing[idx] = 2
+                gearRatio[idx] = ratio
+                gearAngVel[idx] = ratio * omega
+                finishMesh(idx, parent, beta)
+                gearVerts.add(buildGearVerts(gearTip[idx], gearRoot[idx], gearTeeth[idx]))
+                placed++
+                satCount = placed   // 同上：让下一颗成员/下一组锚轮能看到已放卫星
+                parent = idx
+                mi++
+            }
+            g++
+        }
+        satCount = placed
+    }
+
+    /**
+     * 生成齿廓顶点 [x0,y0,...]（绕轮心的世界半径偏移）。
+     * 每齿 5 点（相对齿距）：root@0.00、root@0.22、tip@0.36、tip@0.64、root@0.78
+     * ⇒ 齿顶宽 0.28 齿距、齿槽跨 0.78→1.22（宽 0.44），两侧留横向余量（backlash）。
+     */
+    private fun buildGearVerts(tip: Float, root: Float, teeth: Int): FloatArray {
+        val verts = FloatArray(teeth * 5 * 2)
+        val st = TAU / teeth
+        var o = 0
+        var t = 0
+        while (t < teeth) {
+            val base = t * st
+            var k = 0
+            while (k < 5) {
+                val frac = when (k) {
+                    0 -> 0f
+                    1 -> 0.22f
+                    2 -> 0.36f
+                    3 -> 0.64f
+                    else -> 0.78f
+                }
+                val rad = if (k == 2 || k == 3) tip else root
+                val a = base + frac * st
+                verts[o] = cos(a) * rad
+                verts[o + 1] = sin(a) * rad
+                o += 2
+                k++
+            }
+            t++
+        }
+        return verts
+    }
+
+    // ══ 纹理层缓存（全部只在 onEnter / 画布尺寸变化时建；draw 内零分配）════════
+
+    /**
+     * 背景 / 光层缓存 —— **只在画布尺寸变化时**重建（[onEnter] 会把键清成 −1）。
+     * ⛔ 这里不碰 elapsed / mainAngle / 啮合相位 / 音频平滑 / groupEnergy。
+     *
+     * 缓存点：[bgDepthBrush] 中心纵深、[vignetteBrush] 暗角（两者以**半对角线**为
+     * 半径 ⇒ 任意宽高比四角恰好落在渐变末端、整屏铺满）、[ambientBrush] 环境光晕环
+     * （半径 ∝ unit）、[fillBrushes] 齿内渐变（主组 13 + 卫星 ≤9 支，绝对坐标 ⇒ 必须随
+     * 尺寸重建；坐标为 scale=1 世界坐标，与齿轮路径同处整组缩放变换内 ⇒ 能量缩放时恒对齐）、
+     * 颗粒 tile 位图（短边档不变则复用；LOW 不建）。
+     * ⛔ 本函数**不重掷布局**（布局是世界坐标，尺寸变化只换 unit）。
+     */
+    private fun ensureLayout(w: Float, h: Float, minDim: Float, cx: Float, cy: Float, unit: Float) {
+        if (layoutW == w && layoutH == h) return
+        layoutW = w
+        layoutH = h
+
+        val halfDiag = sqrt(w * w + h * h) * 0.5f
+        val depthCore = Color(BG_CORE)
+        bgDepthBrush = Brush.radialGradient(
+            0f to depthCore,
+            BG_CENTER_STOP to depthCore,
+            1f to depthCore.copy(alpha = 0f),
+            center = Offset(cx, cy),
+            radius = halfDiag
+        )
+        vignetteBrush = Brush.radialGradient(
+            VIG_START to Color.Black.copy(alpha = 0f),
+            1f to Color.Black.copy(alpha = VIG_EDGE_ALPHA),
+            center = Offset(cx, cy),
+            radius = halfDiag
+        )
+        ambientBrush = Brush.radialGradient(
+            0f to goldDim.copy(alpha = 0f),
+            AMBIENT_INNER to goldDim.copy(alpha = 0f),
+            AMBIENT_PEAK to goldDim.copy(alpha = 1f),
+            1f to goldDim.copy(alpha = 0f),
+            center = Offset(cx, cy),
+            radius = AMBIENT_RADIUS * unit
+        )
+
+        // 齿内能量场：中心略亮、边缘透明（主组 13 + 卫星各一支；Brush 持绝对坐标）
+        var g = 0
+        while (g < N_MAIN + satCount) {
+            val col = if (gearRing[g] == 2) coldGray else gold
+            fillBrushes[g] = Brush.radialGradient(
+                0f to col.copy(alpha = FILL_CENTER_ALPHA),
+                FILL_MID_STOP to col.copy(alpha = FILL_MID_ALPHA),
+                1f to col.copy(alpha = 0f),
+                center = Offset(cx + gearX[g] * unit, cy + gearY[g] * unit),
+                radius = gearTip[g] * unit
+            )
+            g++
+        }
+
+        // 颗粒 tile 边长只由「短边档」定（1080p→128 / 4K→256）⇒ 平铺 call 数两种
+        // 分辨率都 ≈135；tile 图案与画布尺寸无关 ⇒ 档不变就不重建
+        if (tier > 0) {
+            val tile = if (minDim >= GRAIN_TILE_LARGE_MIN) GRAIN_TILE_HI else GRAIN_TILE
+            if (tile != grainTilePx) buildGrainTile(tile)
+        }
+    }
+
+    /**
+     * 颗粒 tile 预渲染（固定种子 ⇒ 图案可复现、稳态不闪）。
+     * 白 speckle + r² 偏斜（多数像素近乎透明）⇒ 细而不"沙"；整体 α 在 [drawGrain] 上。
+     */
+    private fun buildGrainTile(tile: Int) {
+        releaseGrain()
+        val px = IntArray(tile * tile)
+        var rng = 0x9E3779B9u
+        var i = 0
+        while (i < px.size) {
+            rng = rng * 1664525u + 1013904223u
+            val r = (rng shr 8).toFloat() / 16777216f
+            val a = (r * r * 255f).toInt().coerceIn(0, 255)
+            px[i] = (a shl 24) or 0x00FFFFFF
+            i++
+        }
+        val bmp = Bitmap.createBitmap(tile, tile, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(px, 0, tile, 0, 0, tile, tile)
+        grainBitmap = bmp.asImageBitmap()
+        grainTilePx = tile
+    }
+
+    /** 归还颗粒位图（onEnter 重入 / onExit）—— API22-25 像素在 native 堆，必须显式 recycle */
+    private fun releaseGrain() {
+        try {
+            grainBitmap?.asAndroidBitmap()?.recycle()
+        } catch (_: Exception) {
+        }
+        grainBitmap = null
+        grainTilePx = 0
+    }
+
+    /** 颗粒层：tile 平铺整屏（`IntOffset` 是 value class，循环体零分配） */
+    private fun DrawScope.drawGrain(w: Float, h: Float) {
+        val bmp = grainBitmap ?: return
+        val tile = grainTilePx
+        if (tile <= 0) return
+        val a = if (tier >= 2) GRAIN_ALPHA_HIGH else GRAIN_ALPHA_MED
+        var y = 0
+        while (y < h) {
+            var x = 0
+            while (x < w) {
+                drawImage(bmp, dstOffset = IntOffset(x, y), alpha = a, blendMode = BlendMode.SrcOver)
+                x += tile
+            }
+            y += tile
+        }
+    }
+
+    /**
+     * 星野：固定种子位置（onEnter 生成 ⇒ 零闪烁）+ **缓慢椭圆漂移**（同一周期、
+     * 每颗相位不同 ⇒ 不同步）+ 全局微脉动。半径 × minDim、位置 × w/h ⇒ 横竖屏自适应。
+     */
+    private fun DrawScope.drawStars(w: Float, h: Float, minDim: Float) {
+        if (starCount == 0) return
+        val t = (elapsed % STAR_DRIFT_PERIOD) / STAR_DRIFT_PERIOD * TAU
+        val pulse = 0.85f + 0.15f * sin((elapsed % STAR_PULSE_PERIOD) / STAR_PULSE_PERIOD * TAU)
+        val dx = STAR_DRIFT * w
+        val dy = STAR_DRIFT * h
+        var s = 0
+        while (s < starCount) {
+            val ph = starPh[s]
+            drawCircle(
+                color = if ((s and 3) == 0) starBlue else starWhite,
+                radius = starR[s] * minDim,
+                center = Offset(starX[s] * w + cos(t + ph) * dx, starY[s] * h + sin(t + ph) * dy),
+                alpha = starA[s] * pulse,
+                blendMode = BlendMode.Plus
+            )
+            s++
+        }
+    }
+
+    override fun DrawScope.draw(frame: AudioFrame, ctx: RenderContext) {
+        val w = size.width
+        val h = size.height
+        if (w < 2f || h < 2f || gearCount == 0) return
+
+        // ── dt 累加器（elapsed 只在 onEnter 归零）────────────────────────
+        // 时间基 = 渲染时钟。⛔ 不用 ctx.nowMs —— 它是 25Hz 分析线程取样的
+        // f.timeMs：暂停后只补发一帧静音就再也不更新（PcmSpectrumTap 版本号不变
+        // 直接 return）、PCM 卡顿同理 ⇒ elapsed 停走、整组停转；且 40ms 量化步进
+        // 与 60fps 渲染不合拍。与 WorldRenderer 同一约定（时间推进自己取样）。
+        val now = SystemClock.uptimeMillis()
+        if (lastMs == 0L) lastMs = now
+        val dt = ((now - lastMs) / 1000f).coerceIn(0f, 0.1f)
+        lastMs = now
+        elapsed += dt
+
+        // ── 音频平滑（律动通道，线性）──────────────────────────────────
+        bassS += (frame.bass - bassS) * SMOOTH
+        midS += (frame.mid - midS) * SMOOTH
+        trebleS += (frame.treble - trebleS) * SMOOTH
+        energyS += (frame.energy - energyS) * SMOOTH
+        // 整组缩放/发光走**第二级**更慢 EMA（独立小 α ≈0.06；尺寸变化不碰）
+        groupEnergy += (energyS - groupEnergy) * SCALE_EMA
+
+        val cx = w * 0.5f
+        val cy = h * 0.5f
+        val unit = FIT_K * ctx.minDim / WORLD_EXTENT   // 85% 半短边适配（峰值×1.05 ⇒ 89.4%），横竖屏同值
+
+        // 背景/光层缓存：仅尺寸变化时重建（⛔ 不碰 elapsed/相位/音频平滑）
+        ensureLayout(w, h, ctx.minDim, cx, cy, unit)
+
+        // ── 棘轮：pulse 上升沿推进一个中心齿距 ──────────────────────────
+        if (frame.pulse - lastPulse > RATCHET_THRESH) {
+            ratchetTarget += gearStep[0]
+        }
+        lastPulse = frame.pulse
+
+        // ── 驱动角 = 匀速基线（绝对式）+ 棘轮缓动分量（只加不减）──────────
+        //    ⚠️ 两段必须**分开累加**（TV 第 4 轮反馈「齿轮并未一直旋转、偶尔停顿、
+        //    偶尔反转抽搐」的根因）：旧实现把棘轮弹簧直接加在含基线的 mainAngle 上，
+        //    而 ratchetTarget 里只有棘轮、没有基线 ⇒ 弹簧每帧把刚加上去的基线又
+        //    减回去，稳态收敛到 mainAngle ≈ ratchetTarget + BASE·RATCHET_MS/1000、
+        //    净速率为 0 —— 鼓点之间整组冻住（停顿），只有鼓点时才"跳一齿"（抽搐），
+        //    反向子轮（gearRatio<0）在每次跳变里看着像倒抽（反转）；无鼓点素材
+        //    更是几分钟纹丝不动。
+        //    现在：基线 = BASE_SPEED·elapsed 绝对求值（elapsed 单调 ⇒ 每帧恒正推进、
+        //    天然不回退、无累积漂移）；棘轮只在自己的 ratchetAngle 上缓动（目标恒
+        //    ≥ 当前、ease<1 ⇒ 只加不减、不过冲）；两者相加 ⇒ 帧帧推进、永不停顿、
+        //    永不反转。基线与卫星组共用**同一个 elapsed**（同一时间基、同一 dt 钳位）。
+        //    ⚠️ 不接 treble/mid 调速：帧间抖动会让角速度忽快忽慢；
+        //    子轮无独立自转，全部 angle = phase + ratio·mainAngle 刚性跟随。
+        //    不做 TAU 回绕：子轮回绕会跳 ratio·TAU（齿对齿但辐条可见跳位），
+        //    且浮点增长 24h 内相位误差仍 < 1% 齿距。
+        val ease = (dt * 1000f / RATCHET_MS).coerceIn(0f, 1f)
+        ratchetAngle += (ratchetTarget - ratchetAngle) * ease
+        mainAngle = BASE_SPEED * elapsed + ratchetAngle
+
+        // ── 音频映射 → 强度（α 公式 + 上限，见交付报告映射表）──────────
+        val gearAlpha = (0.62f + bassS * 0.33f).coerceAtMost(0.95f)
+        val bezelAlpha = (0.10f + midS * 0.22f).coerceAtMost(0.32f)
+        val orbitAlpha = (0.06f + energyS * 0.14f).coerceAtMost(0.20f)
+        val sparkAlpha = (0.15f + trebleS * 0.65f).coerceAtMost(0.80f)
+        val gStroke = if (bassS > 0.55f) strokeGearFat else strokeGear   // 1.6 ↔ 2.2px
+
+        // ── energy → 整组缩放 / 发光总强度（全部读 groupEnergy：慢 EMA + 上限）──
+        val glowGain = (GLOW_GAIN_BASE + GLOW_GAIN_ENERGY * groupEnergy).coerceAtMost(GLOW_GAIN_MAX)
+        val glowStrokeAlpha = (GLOW_STROKE_BASE + GLOW_STROKE_ENERGY * groupEnergy)
+            .coerceAtMost(GLOW_STROKE_MAX)
+        val ambientAlpha = (AMBIENT_ALPHA_BASE + AMBIENT_ALPHA_ENERGY * groupEnergy)
+            .coerceAtMost(AMBIENT_ALPHA_MAX)
+        val linkAlpha = (LINK_ALPHA_BASE + LINK_ALPHA_ENERGY * groupEnergy).coerceAtMost(LINK_ALPHA_MAX)
+        val fillAlpha = ((0.50f + bassS * 0.45f) * glowGain).coerceAtMost(1f)
+        // 均匀缩放 = 静音基础呼吸（±1.0%、9s）+ energy 增益（0~5%）⇒ 区间 [0.98, 1.05]
+        val breathPh = (elapsed % SCALE_BREATH_PERIOD) / SCALE_BREATH_PERIOD * TAU
+        val groupScale = (SCALE_BASE + SCALE_BREATH * sin(breathPh) +
+            SCALE_ENERGY_GAIN * groupEnergy).coerceIn(SCALE_MIN, SCALE_MAX)
+
+        // ══ 背景空间感（整屏底层；画在整组缩放之外，全按屏幕尺寸计算）═════════
+        drawRect(Color(BG_BASE))                 // ① 近黑基底（任意宽高比恒铺满）
+        drawRect(bgDepthBrush!!)                 // ② 中心 #0B0E15 极淡径向纵深
+        drawRect(vignetteBrush!!)                // ③ 暗角：四角/边缘压暗（纯径向渐变）
+        drawGrain(w, h)                          // ④ 颗粒 tile 平铺（LOW 省略）
+        drawStars(w, h, ctx.minDim)              // ⑤ 固定种子星点（缓漂移）
+
+        // ══ 整组能量缩放：绕画面中心的**均匀**缩放（canvas 原生变换，零分配）═══
+        //    所有半径/中心距同比缩放 ⇒ 啮合/相位/运动学一行未动；
+        //    齿内填充 Brush 按 scale=1 坐标缓存，与路径同处本变换内 ⇒ 恒对齐。
+        val cvs = drawContext.canvas
+        cvs.save()
+        cvs.translate(cx, cy)
+        cvs.scale(groupScale, groupScale)
+        cvs.translate(-cx, -cy)
+
+        // ── 层 0 · 环境光晕：齿轮群外围一圈极淡的大范围光（径向渐变环，禁模糊）──
+        drawCircle(ambientBrush!!, radius = AMBIENT_RADIUS * unit, center = Offset(cx, cy),
+            alpha = ambientAlpha, blendMode = BlendMode.Plus)
+
+        // ── 层 1 · 表圈：刻度环（60 格，每 5 格长刻度）──────────────────
+        //    半径 = BEZEL_R(1.05) ⇒ 生成期卫星带以它为外框（tip 圆不得越过）
+        val bezelR = BEZEL_R * unit
+        drawCircle(goldDim, radius = bezelR, center = Offset(cx, cy),
+            style = strokeBezel, alpha = bezelAlpha, blendMode = BlendMode.Plus)
+        var tk = 0
+        while (tk < 60) {
+            val a = tk * TAU / 60f
+            val cs = cos(a)
+            val sn = sin(a)
+            val long = tk % 5 == 0
+            val len = if (long) 0.034f * unit else 0.016f * unit
+            drawLine(goldDim,
+                Offset(cx + cs * (bezelR - len), cy + sn * (bezelR - len)),
+                Offset(cx + cs * bezelR, cy + sn * bezelR),
+                strokeWidth = if (long) 1.4f else 1f,
+                alpha = (bezelAlpha * (if (long) 1.6f else 1f)).coerceAtMost(0.5f),
+                blendMode = BlendMode.Plus)
+            tk++
+        }
+
+        // ── 层 2 · 节圆导引：中心 / 内圈 / 外圈三道淡环 ──────────────────
+        drawCircle(goldDim, radius = gearRp[0] * unit, center = Offset(cx, cy),
+            style = strokeBezel, alpha = orbitAlpha * 0.7f, blendMode = BlendMode.Plus)
+        drawCircle(goldDim, radius = orbit1R * unit, center = Offset(cx, cy),
+            style = strokeBezel, alpha = orbitAlpha, blendMode = BlendMode.Plus)
+        drawCircle(goldDim, radius = orbit2R * unit, center = Offset(cx, cy),
+            style = strokeBezel, alpha = orbitAlpha, blendMode = BlendMode.Plus)
+
+        // ── 层 2.5 · 啮合连线：父子轮中心连线（星群/分子结构感）──────────
+        //    强度取全层最弱档（linkAlpha）；⛔ 必须画在齿轮层之前
+        var lg = 1
+        while (lg < gearCount) {
+            val p = gearParent[lg]
+            drawLine(goldDim,
+                Offset(cx + gearX[p] * unit, cy + gearY[p] * unit),
+                Offset(cx + gearX[lg] * unit, cy + gearY[lg] * unit),
+                strokeWidth = 1f, alpha = linkAlpha, blendMode = BlendMode.Plus)
+            lg++
+        }
+
+        // ── 层 3 · 齿轮：齿内填充 + 双层描边 + 轴毂 + 辐条。
+        //    ⚠️ 旋转烘焙进顶点（手算世界坐标），绝不用 withTransform({ rotate })：
+        //    Compose DrawTransform.rotate 默认 pivot=画布中心，会让所有齿轮绕同一
+        //    固定点公转（历史反馈"整体绕右下角旋转"的根因）。cos/sin 矩阵作用于
+        //    轮心偏移后的顶点，齿轮只绕自身轴心自转。
+        //    两段连续绘制：主组 [0, gearCount)、卫星 [N_MAIN, N_MAIN+satCount)；
+        //    idx 换算是纯算术 ⇒ 零分配。主组角 = phase + ratio·mainAngle（含棘轮），
+        //    卫星角 = phase + ω·elapsed（恒速、永不停、不接棘轮）。
+        val drawCount = gearCount + satCount
+        var g = 0
+        while (g < drawCount) {
+            val idx = if (g < gearCount) g else N_MAIN + (g - gearCount)
+            val tipPx = gearTip[idx] * unit
+            val rootPx = gearRoot[idx] * unit
+            val ring = gearRing[idx]
+            val color = if (ring == 2) coldGray else gold   // 内芯金、外圈冷灰
+            val alpha = (gearAlpha - ring * 0.08f).coerceAtLeast(0.45f)
+            val angle = if (idx < N_MAIN) {
+                mainAngle * gearRatio[idx] + gearPhase[idx]
+            } else {
+                gearPhase[idx] + gearAngVel[idx] * elapsed
+            }
+            val x = cx + gearX[idx] * unit
+            val y = cy + gearY[idx] * unit
+            val cosA = cos(angle)
+            val sinA = sin(angle)
+
+            // 轮廓：顶点 → 世界坐标烘焙旋转，复用单例 Path（零分配）
+            val verts = gearVerts[idx]
+            gearPath.reset()
+            var vi = 0
+            while (vi < verts.size) {
+                val ux = verts[vi]
+                val uy = verts[vi + 1]
+                val wx = x + (ux * cosA - uy * sinA) * unit
+                val wy = y + (ux * sinA + uy * cosA) * unit
+                if (vi == 0) gearPath.moveTo(wx, wy) else gearPath.lineTo(wx, wy)
+                vi += 2
+            }
+            gearPath.close()
+            // 齿内能量场：中心略亮、边缘透明的径向渐变（Brush 按尺寸缓存，draw 不新建）
+            drawPath(gearPath, fillBrushes[idx]!!, alpha = fillAlpha, blendMode = BlendMode.Plus)
+            // 双层描边 · 外遍：宽而淡的金色光晕（静态基础 α + energy 缓升；成员 Stroke 复用）
+            drawPath(gearPath, gold, style = strokeGlow, alpha = glowStrokeAlpha,
+                blendMode = BlendMode.Plus)
+            // 双层描边 · 内遍：亮金细线（原 gStroke，1.6 ↔ 2.2px 量化）
+            drawPath(gearPath, color, style = gStroke, alpha = alpha,
+                blendMode = BlendMode.Plus)
+
+            // 轴毂：显式绝对中心，**无逐轮 rotate 变换**（半径/stroke 均为屏幕像素；
+            // 只受整组均匀缩放影响，不随齿轮自转）
+            drawCircle(color, radius = tipPx * 0.26f, center = Offset(x, y),
+                style = strokeHub, alpha = alpha * 0.8f, blendMode = BlendMode.Plus)
+
+            // 辐条：中 6 / 内 4 / 外 3 根（卫星 ring=2 ⇒ 3 根），端点手算旋转
+            val spokeN = when (ring) {
+                0 -> 6
+                1 -> 4
+                else -> 3
+            }
+            val r0 = tipPx * 0.30f
+            val r1 = rootPx * 0.94f
+            var sp = 0
+            while (sp < spokeN) {
+                val sa = sp * TAU / spokeN + angle
+                val cs = cos(sa)
+                val ss = sin(sa)
+                drawLine(color,
+                    Offset(x + r0 * cs, y + r0 * ss),
+                    Offset(x + r1 * cs, y + r1 * ss),
+                    strokeWidth = 1.0f, alpha = alpha * 0.7f, blendMode = BlendMode.Plus)
+                sp++
+            }
+            g++
+        }
+
+        // ── 层 4 · 轴心脉动点 + 核心发光光晕（轴静止不随齿轮旋转；pulse 驱动半径。
+        //    光晕 2 层渐隐同心圆，Plus 累加 ⇒ 核心亮、外围渐隐；
+        //    ringBoost 1.0 / 0.6 / 0.4 ⇒ 中心轮最亮、向外递减（卫星 ring=2 ⇒ 0.4））──
+        g = 0
+        while (g < drawCount) {
+            val idx = if (g < gearCount) g else N_MAIN + (g - gearCount)
+            val x = cx + gearX[idx] * unit
+            val y = cy + gearY[idx] * unit
+            val coreR = gearTip[idx] * unit * (0.05f + frame.pulse * 0.025f)
+            val ringBoost = when (gearRing[idx]) {
+                0 -> 1f
+                1 -> 0.6f
+                else -> 0.4f
+            }
+            drawCircle(gold, radius = coreR * CORE_RING_R_OUT, center = Offset(x, y),
+                alpha = CORE_RING_ALPHA_OUT * ringBoost * glowGain, blendMode = BlendMode.Plus)
+            drawCircle(gold, radius = coreR * CORE_RING_R_IN, center = Offset(x, y),
+                alpha = CORE_RING_ALPHA_IN * ringBoost * glowGain, blendMode = BlendMode.Plus)
+            drawCircle(goldDim, radius = coreR, center = Offset(x, y),
+                alpha = 0.9f, blendMode = BlendMode.Plus)
+            g++
+        }
+
+        // ── 层 5 · 青色啮合火花：每个接触点一粒（treble 调 α、pulse 放大、
+        //    elapsed 微闪）。主组：每个啮合节点一粒 ─────────────────────────
+        var s = 1
+        while (s < gearCount) {
+            val tw = 0.65f + 0.35f * sin(elapsed * 2.4f + s * 1.7f)
+            val rad = (1.8f + frame.pulse * 1.6f) * tw
+            drawCircle(cyanSpark, radius = rad,
+                center = Offset(cx + sparkX[s] * unit, cy + sparkY[s] * unit),
+                alpha = (sparkAlpha * tw).coerceAtMost(0.80f), blendMode = BlendMode.Plus)
+            s++
+        }
+
+        // 层 5（续）· 卫星组内啮合火花：同一公式、同一 α 上限；锚轮无接触点
+        // （gearParent[idx] == idx ⇒ 跳过）。⛔ 参数与主组完全一致，只是覆盖新齿轮。
+        var q = 0
+        while (q < satCount) {
+            val idx = N_MAIN + q
+            if (gearParent[idx] != idx) {
+                val tw = 0.65f + 0.35f * sin(elapsed * 2.4f + idx * 1.7f)
+                val rad = (1.8f + frame.pulse * 1.6f) * tw
+                drawCircle(cyanSpark, radius = rad,
+                    center = Offset(cx + sparkX[idx] * unit, cy + sparkY[idx] * unit),
+                    alpha = (sparkAlpha * tw).coerceAtMost(0.80f), blendMode = BlendMode.Plus)
+            }
+            q++
+        }
+
+        // 整组缩放变换收尾（与上方 save 成对；两行之间无 early-return，恒平衡）
+        cvs.restore()
+    }
+}
+
+/**
+ * E35 `LIGHT_BEAMS` — 光轴 · 旋转光轴
+ *
+ * 视觉：几束极细光束从屏幕边缘向中心射出（激光灯交叉扫射）。低音改变光束仰角（缓变），
+ * 高频让光束瞬间碎裂成虚线（手动分段，避开 `dashPathEffect` 的每帧分配）。
+ *
+ * ## T4.10（§B10 五条）改造
+ * **① 光束改渐变** —— 旧实现是「2 条**等宽** `drawLine`（7f 辉光 + 1.6f 芯线）+ 1 个
+ * `alpha 0.05` 的**纯色**扇形多边形」，三者都是硬边色块。现改为 **2 个锥形多边形**
+ * （体积体 + 芯线；外缘端粗 / 中心端细 ⇒ 纵深），沿光束轴填 `Brush.linearGradient`
+ * （**外缘端** `alpha 0.42` → **中心端** 透明，§B10-① 明文）。几何与 `Brush` **只在
+ * `(cx, cy, maxLen, accent, secondary)` 变化时重建**（照 `RadarGridRenderer.ensureBrush`
+ * 范式）；逐束旋转交给 `withTransform`（**`inline` ⇒ 零分配**，§15.4-A7；先例
+ * `BatchThreeRenderers.kt:203`）。⛔ 扇形多边形**删除**（理由见 §12.4）。
+ * **② 体积雾** —— 新增 `ProceduralTexture.Id.FOG`（**第 8 类 tile**，全屏型灰白低频雾团），
+ * 整屏 1 次 `drawImage`（`alpha = 0.12`，§B10-② 明文），中心随 `sectionEnergy` 缓慢漂移
+ * （`dstSize` 放大 [FOG_OVERSCAN]、`dstOffset` 落在 `[-2·ov, 0]` ⇒ 漂移不露边）。
+ * **③ 尘埃** —— [DUST_N] 个极小亮点（半径 0.50 / 0.65 / 0.80 px，`alpha` 0.20 / 0.32 / 0.45，
+ * `Plus`），沿**各自所属光束**方向缓慢漂移（越界环绕 ⇒ 数量恒定，**不重生**）。
+ * 按**固定下标**分 [DUST_BUCKETS] 桶，每桶合批 1 条 `Path` ⇒ 每帧恒 3 次 `drawPath`
+ * （⛔ 不是 48 次 `drawCircle`）。
+ * **④ 镜头光斑** —— 交汇处 1 组「光晕（1 次 `Shading2D.shadeBrushCached`，带具名盐
+ * [E35_KEY_SALT]）+ 六芒（[FLARE_SPOKES] 条 `drawLine`）」，§B10-④ 明文。
+ * **⑤ 后处理** —— `postFx`（暗角 0.50 + 颗粒 0.030，§B10-⑤ 明文）。
+ *
+ * ## ⛔ 迁移顺带修掉的两条红线（§B10 未列）
+ * - `private var lastMs = 0L` + `if (lastMs == 0L) lastMs = now` **哨兵** —— `FrameClock`
+ *   的 KDoc 明确不得用 `0L` 当哨兵（首帧 `timeMs` 可能恰为 0）⇒ 删除 `lastMs`，改走 `fx.dt`；
+ * - `val tSec = frame.timeMs * 0.001f` **当相位** —— 开机毫秒是大基数，float 尾数不足
+ *   ⇒ 相位冻结 / 跳变（§10.176 根因⑩）。改为**增量式相位**：`elapsedSec += fx.dt` 与
+ *   `beamAng[i] = advanceBeamAngle(beamAng[i], fx.dt, …)`。
+ *
+ * 性能红线：`drawContent` 内零分配（`withTransform` 是 `inline`，其 lambda 内联、不分配）。
+ */
+class LightBeamsRenderer : RendererFx() {
+
+    override val theme = VisualizerTheme.LIGHT_BEAMS
+
+    /** §B10-⑤ 后处理（⛔ 数值字面量，基类要求） */
+    override val postFx = PostFx(vignette = 0.50f, grain = 0.030f)
+
+    internal companion object {
+        const val TAU = (2 * Math.PI).toFloat()
+
+        /** 光束数上限（HIGH 档；LOW 4 / MEDIUM 6 / HIGH 8） */
+        const val BEAM_MAX = 8
+
+        /** 碎裂虚线的分段数 */
+        const val SEGMENTS = 14
+
+        /** 虚线占空比（每段只画前 55%） */
+        const val SEG_DUTY = 0.55f
+
+        /** 仰角低通系数 */
+        const val ELEV_SMOOTH = 0.06f
+
+        /** 仰角最大偏转（度） */
+        const val MAX_ELEV_DEG = 14f
+
+        /** 度 → 弧度 */
+        const val DEG2RAD = 0.017453292f
+
+        /** 弧度 → 度 */
+        const val RAD2DEG = 57.29578f
+
+        // ── §B10-① 光束渐变 ────────────────────────────────────────────
+        /** 光束**外缘端**（起点）的渐变 alpha —— §B10-① 明文 0.42 */
+        const val BEAM_NEAR_ALPHA = 0.42f
+
+        /** 光束**中心端**（终点）的渐变 alpha —— §B10-① 明文「透明」 */
+        const val BEAM_FAR_ALPHA = 0f
+
+        /** 芯线**外缘端** alpha（比体积体更亮 ⇒ 激光芯） */
+        const val CORE_NEAR_ALPHA = 0.86f
+
+        /** 体积体半宽（× `maxLen`）：外缘端 / 中心端（由粗到细 = 纵深） */
+        const val BEAM_HALF_W_NEAR = 0.0060f
+        const val BEAM_HALF_W_FAR = 0.0009f
+
+        /** 芯线半宽相对体积体的比例（≈ 1 px @1080p） */
+        const val CORE_W_K = 0.14f
+
+        /** 光束外缘端半径 / 中心端半径（× `maxLen`） */
+        const val START_R_K = 1.05f
+        const val END_R_K = 0.06f
+
+        // ── §B10-② 体积雾 ──────────────────────────────────────────────
+        /** 雾层 alpha —— §B10-② 明文 0.12 */
+        const val FOG_ALPHA = 0.12f
+
+        /** 雾漂移基准速度（× `maxLen` / s），随 `sectionEnergy` 放大 */
+        const val FOG_DRIFT = 0.012f
+
+        /** 雾漂移的纵向 / 横向速率比（避免纯斜线漂移） */
+        const val FOG_DRIFT_Y_K = 0.61f
+
+        /** 雾过扫描量（px）—— 漂移 ±[FOG_OVERSCAN] 时仍铺满画布（不露边） */
+        const val FOG_OVERSCAN = 48
+
+        // ── §B10-③ 尘埃 ────────────────────────────────────────────────
+        /** 尘埃数 —— §B10-③ 明文 40–60 */
+        const val DUST_N = 48
+
+        /** 尘埃合批桶数 —— §B10-③ 明文「3 条 `Path`」 */
+        const val DUST_BUCKETS = 3
+
+        /** 尘埃池字段跨度：x / y / 所属光束下标 / 半径（x、y 为**归一化**坐标） */
+        const val DUST_STRIDE = 4
+
+        /** 3 桶各自半径（px）—— 直径 1.0 / 1.3 / 1.6，落在 §B10-③ 的 1–1.6 px */
+        val DUST_R = floatArrayOf(0.50f, 0.65f, 0.80f)
+
+        /** 3 桶各自 alpha —— 落在 §B10-③ 的 0.20–0.45 */
+        val DUST_ALPHAS = floatArrayOf(0.20f, 0.32f, 0.45f)
+
+        /** 沿所属光束方向的漂移速度（归一化坐标 / s；≈ 18 s 穿过一屏） */
+        const val DUST_DRIFT = 0.055f
+
+        /** 圆的三次贝塞尔 kappa（标准值 0.5523） */
+        const val KAPPA = 0.5522847f
+
+        // ── §B10-④ 镜头光斑 ────────────────────────────────────────────
+        /** 光晕半径（× `minDim`） */
+        const val FLARE_R_K = 0.085f
+
+        /** 六芒线半长（× 光晕半径） */
+        const val FLARE_SPOKE_K = 2.10f
+
+        /** 六芒线宽（px） */
+        const val FLARE_SPOKE_W = 1.3f
+
+        /** 六芒条数（3 条过中心 ⇒ 6 个芒尖）—— §B10-④ 明文「3 条 `drawLine`」 */
+        const val FLARE_SPOKES = 3
+
+        /** 光晕自转速率（rad/s） */
+        const val FLARE_SPIN = 0.25f
+
+        /** 中心光核基准半径（px）与 pulse 增益 */
+        const val CORE_R = 6f
+        const val CORE_R_PULSE = 14f
+
+        /**
+         * `Shading2D.shadeBrushCached` 的**具名盐**。⛔ `Shading2D` 是 Kotlin **object**
+         * ⇒ 它的 16 槽 `Brush` 缓存**进程级共享**；不带盐会在切换效果后复用别人的
+         * 半径与基色（§四 G4 / §12.4）。
+         */
+        const val E35_KEY_SALT = 0x35353535L
+
+        // ── 纯函数（供门禁直调，⛔ 不复制算法）────────────────────────
+
+        /** 光束角度累加（`dt` 化 ⇒ 30 / 60 / 120 fps 下 1 秒累计量恒等） */
+        internal fun advanceBeamAngle(
+            ang: Float, dtSec: Float, speed: Float, trebleSmooth: Float
+        ): Float = ang + speed * (0.5f + trebleSmooth * 0.8f) * dtSec
+
+        /** 光束当前极角 = 基准角 + 累加相位 + 静态错相位 */
+        internal fun beamAngleOf(baseAng: Float, phaseAccum: Float, phaseStatic: Float): Float =
+            baseAng + phaseAccum + phaseStatic * 0.1f
+
+        /** 尘埃分桶（按**固定下标** ⇒ 桶不逐帧跳变，避免尺寸/亮度闪烁） */
+        internal fun dustBucketOf(index: Int): Int {
+            val b = index % DUST_BUCKETS
+            return if (b < 0) b + DUST_BUCKETS else b
+        }
+
+        /** 尘埃沿光束方向的位移增量（`dt` 化；越界由 [wrap01] 环绕） */
+        internal fun driftDelta(dtSec: Float, speed: Float): Float = speed * dtSec
+
+        /** 归一化坐标环绕到 `[0, 1)`（⛔ 不用 `%`：Kotlin 的 `%` 保留被除数符号） */
+        internal fun wrap01(v: Float): Float {
+            if (v >= 0f && v < 1f) return v
+            val f = v - floor(v)
+            return when {
+                f >= 1f -> 0f
+                f < 0f -> f + 1f
+                else -> f
+            }
+        }
+    }
+
+    // ── 每束光的静态参数（`onEnterContent` 预生成）──
+    private var beamPhase = FloatArray(0)
+    private var beamSpeed = FloatArray(0)
+    private var beamBaseAng = FloatArray(0)
+
+    /** 逐束**增量式**角度累加（§10.176：⛔ 不用 `timeMs × 系数` 当相位） */
+    private var beamAng = FloatArray(0)
+
+    /** 逐束本帧最终极角（尘埃要用它当漂移方向） */
+    private var beamFinalAng = FloatArray(0)
+    private var beamCount = 0
+
+    private var elevSmooth = 0f
+    private var trebleSmooth = 0f
+
+    /** 相位累计时间（秒）—— 由 `fx.dt` 累加（⛔ 不是 `frame.timeMs`） */
+    private var elapsedSec = 0f
+
+    /** 雾漂移累计（归一化坐标 0..1） */
+    private var fogDriftX = 0f
+    private var fogDriftY = 0f
+
+    // ── §B10-① 光束几何（**规范朝向**：自 `(cx, cy)` 沿 +X 伸出；逐束靠 `withTransform` 旋转）──
+    private var beamBody: Path? = null
+    private var beamCore: Path? = null
+
+    /** 4 个缓存 `Brush`：体积体 / 芯线 × accent / secondary（⛔ 不每帧重建） */
+    private var bodyBrushA: Brush? = null
+    private var coreBrushA: Brush? = null
+    private var bodyBrushB: Brush? = null
+    private var coreBrushB: Brush? = null
+
+    /** 碎裂虚线的 `Stroke`（⛔ `Stroke()` 每帧新建会分配 ⇒ 与几何同键缓存） */
+    private var dashStroke: Stroke? = null
+
+    /** 几何 + `Brush` 的缓存键（照 `RadarGridRenderer.ensureBrush` 的哨兵范式） */
+    private var geoCx = -1f
+    private var geoCy = -1f
+    private var geoMaxLen = -1f
+    private var geoAccent = Color.Unspecified
+    private var geoSecondary = Color.Unspecified
+
+    // ── §B10-③ 尘埃池（零分配）：`DUST_N × DUST_STRIDE` 平铺 ──
+    private val dust = FloatArray(DUST_N * DUST_STRIDE)
+
+    /** 3 桶尘埃合批 `Path`（构造期建一次，`draw` 期只 `rewind`） */
+    private val dustPaths = arrayOf(Path(), Path(), Path())
+
+    /** 碎裂虚线合批 `Path`（构造期建一次，逐束 `rewind` 重建） */
+    private val dashPath = Path()
+
+    /** 尘埃色 / 光斑基色（仅在 `accent` 变化时重算 ⇒ draw 期零 JNI） */
+    private var dustColor = Color.White
+    private var flareBase = Color.White
+    private var colorAccent = Color.Unspecified
+
+    protected override fun onEnterContent(ctx: RenderContext) {
+        elevSmooth = 0f
+        trebleSmooth = 0f
+        elapsedSec = 0f
+        fogDriftX = 0f
+        fogDriftY = 0f
+        colorAccent = Color.Unspecified
+        beamBody = null
+        beamCore = null
+        bodyBrushA = null
+        coreBrushA = null
+        bodyBrushB = null
+        coreBrushB = null
+        dashStroke = null
+        geoCx = -1f
+        geoCy = -1f
+        geoMaxLen = -1f
+        geoAccent = Color.Unspecified
+        geoSecondary = Color.Unspecified
+
+        // ── 画质分档：LOW 4 / MEDIUM 6 / HIGH 8 ──
+        beamCount = when (ctx.quality) {
+            VisualQuality.LOW -> 4
+            VisualQuality.MEDIUM -> 6
+            VisualQuality.HIGH -> BEAM_MAX
+        }
+        beamPhase = FloatArray(beamCount)
+        beamSpeed = FloatArray(beamCount)
+        beamBaseAng = FloatArray(beamCount)
+        beamAng = FloatArray(beamCount)
+        beamFinalAng = FloatArray(beamCount)
+        var i = 0
+        while (i < beamCount) {
+            beamPhase[i] = i * 2.399f        // 黄金角错相位
+            beamSpeed[i] = 0.35f + (i % 3) * 0.18f
+            beamBaseAng[i] = i * TAU / beamCount
+            i++
+        }
+
+        // 尘埃池：位置**归一化**（与画布尺寸无关 ⇒ 改分辨率不跳），所属光束下标固定
+        i = 0
+        while (i < DUST_N) {
+            val o = i * DUST_STRIDE
+            dust[o] = rng.next()
+            dust[o + 1] = rng.next()
+            dust[o + 2] = (i % beamCount).toFloat()
+            dust[o + 3] = DUST_R[dustBucketOf(i)]
+            i++
+        }
+    }
+
+    override fun DrawScope.drawContent(frame: AudioFrame, ctx: RenderContext, fx: FxFrame) {
+        val w = size.width
+        val h = size.height
+        if (w < 2f || h < 2f) return
+
+        // ── 时钟：`dt` 只从 `fx` 取（首帧 / 负差 / 上界钳制由 `FrameClock` 统一承担）──
+        elapsedSec += fx.dt
+        elevSmooth += (frame.bass - elevSmooth) * ELEV_SMOOTH
+        trebleSmooth += (frame.treble - trebleSmooth) * 0.25f
+
+        val cx = w * 0.5f
+        val cy = h * 0.5f
+        val minDim = if (w < h) w else h
+        val maxLen = sqrt(w * w + h * h) * 0.55f
+        val accent = ctx.palette.accent
+        val secondary = ctx.palette.secondary
+        ensureColors(accent)
+
+        // ── §B10-② 体积雾：1 层 `Id.FOG`（随 `sectionEnergy` 缓慢漂移；过扫描 ⇒ 不露边）──
+        val iw = w.toInt().coerceIn(1, 4096)
+        val ih = h.toInt().coerceIn(1, 4096)
+        // ⛔ 旧写法 `ProceduralTexture.ensure(iw, ih)` 已废除：它一次烘**全部 6 张**全屏纹理
+        //    （1920×1080 × 6 ≈ 1240 万像素 Kotlin 逐像素 + 6480 次 JNI `setPixels`），且因
+        //    `ctx.canvasSize` 在 `onEnter` 时还是 `Size.Zero` 而必然同步落在**首帧**
+        //    ⇒ 真机实测冷启动首帧黑屏 6369 ms。本效果**只画 FOG 一张** ⇒ 逐张点名，降到约 1/6。
+        // ⚠️ `ensureTiled()` 不能省：`postFx.grain = 0.030f` 经 `OverlayFx.drawGrain`
+        //    读 `tile(Id.GRAIN)`，读不到就静默不画；平铺槽只有它会烘。
+        ProceduralTexture.ensureTiled()
+        ProceduralTexture.ensureFullscreenOnly(ProceduralTexture.Id.FOG, iw, ih)
+        val fogSpeed = FOG_DRIFT * (0.35f + frame.sectionEnergy)
+        fogDriftX = wrap01(fogDriftX + fogSpeed * fx.dt)
+        fogDriftY = wrap01(fogDriftY + fogSpeed * FOG_DRIFT_Y_K * fx.dt)
+        // 漂移 ∈ [-ov, ov]，`dstOffset` = -ov + 漂移 ∈ [-2ov, 0] ⇒ 放大 ov 后仍铺满画布
+        val ov = FOG_OVERSCAN
+        val fogDx = -ov + ((fogDriftX - 0.5f) * 2f * ov).toInt()
+        val fogDy = -ov + ((fogDriftY - 0.5f) * 2f * ov).toInt()
+        ProceduralTexture.tile(ProceduralTexture.Id.FOG)?.let {
+            drawImage(
+                image = it,
+                srcOffset = IntOffset.Zero,
+                srcSize = IntSize(it.width, it.height),
+                dstOffset = IntOffset(fogDx, fogDy),
+                dstSize = IntSize(iw + ov * 2, ih + ov * 2),
+                alpha = FOG_ALPHA,
+                blendMode = BlendMode.Plus
+            )
+        }
+
+        // ── §B10-① 光束：几何 + `Brush` 只在 `(cx, cy, maxLen, accent, secondary)` 变化时重建 ──
+        ensureBeamGeometry(cx, cy, maxLen, accent, secondary)
+        val body = beamBody
+        val core = beamCore
+        val bBodyA = bodyBrushA
+        val cCoreA = coreBrushA
+        val bBodyB = bodyBrushB
+        val cCoreB = coreBrushB
+        val stroke = dashStroke
+        val startR = maxLen * START_R_K
+        val endR = maxLen * END_R_K
+        val broken = frame.treble > 0.50f   // 碎裂触发
+
+        // ── 逐束绘制 ──
+        var i = 0
+        while (i < beamCount) {
+            // 旋转：各束不同速慢转 + treble 加速（**增量式相位**，⛔ 不用 `timeMs × 系数`）
+            beamAng[i] = advanceBeamAngle(beamAng[i], fx.dt, beamSpeed[i], trebleSmooth)
+            // 仰角扰动：低音驱动（低通后）+ 每束相位差
+            val elev = elevSmooth * MAX_ELEV_DEG * DEG2RAD * sin(elapsedSec * 0.6f + beamPhase[i])
+            val finalAng = beamAngleOf(beamBaseAng[i], beamAng[i], beamPhase[i]) + elev
+            beamFinalAng[i] = finalAng
+
+            val even = (i % 2 == 0)
+            val deg = finalAng * RAD2DEG
+
+            if (body == null || core == null || stroke == null) {
+                i++
+                continue
+            }
+            if (!broken) {
+                // 连续光束：**锥形渐变**体积体 + 更亮的芯线（都是渐变 ⇒ 无硬边）
+                if (even) {
+                    withTransform({ rotate(deg, Offset(cx, cy)) }) {
+                        drawPath(body, bBodyA!!, alpha = 1f, blendMode = BlendMode.Plus)
+                        drawPath(core, cCoreA!!, alpha = 1f, blendMode = BlendMode.Plus)
+                    }
+                } else {
+                    withTransform({ rotate(deg, Offset(cx, cy)) }) {
+                        drawPath(body, bBodyB!!, alpha = 1f, blendMode = BlendMode.Plus)
+                        drawPath(core, cCoreB!!, alpha = 1f, blendMode = BlendMode.Plus)
+                    }
+                }
+            } else {
+                // 碎裂虚线：手动分段 + 确定性闪烁（避开 `dashPathEffect` 每帧分配）
+                // ⛔ 合批进 1 条 `Path` ⇒ 每束 1 次 `drawPath`（旧实现是最多 14 次 `drawLine`）
+                dashPath.rewind()
+                val segLen = (startR - endR) / SEGMENTS
+                var s = 0
+                while (s < SEGMENTS) {
+                    val r0 = startR - s * segLen
+                    val r1 = r0 - segLen * SEG_DUTY
+                    val seed = (frame.seq * 17 + i * 31 + s) and 0xFFFFL
+                    if ((seed % 5L) < 3L) {
+                        dashPath.moveTo(cx + r0, cy)
+                        dashPath.lineTo(cx + r1, cy)
+                    }
+                    s++
+                }
+                if (even) {
+                    withTransform({ rotate(deg, Offset(cx, cy)) }) {
+                        drawPath(dashPath, cCoreA!!, alpha = 1f, style = stroke, blendMode = BlendMode.Plus)
+                    }
+                } else {
+                    withTransform({ rotate(deg, Offset(cx, cy)) }) {
+                        drawPath(dashPath, cCoreB!!, alpha = 1f, style = stroke, blendMode = BlendMode.Plus)
+                    }
+                }
+            }
+            i++
+        }
+
+        // ── §B10-③ 尘埃：沿**所属光束**方向漂移（越界环绕 ⇒ 数量恒定）──
+        var b = 0
+        while (b < DUST_BUCKETS) {
+            dustPaths[b].rewind()
+            b++
+        }
+        val dStep = driftDelta(fx.dt, DUST_DRIFT)
+        var k = 0
+        while (k < DUST_N) {
+            val o = k * DUST_STRIDE
+            val bi = dust[o + 2].toInt()
+            val dir = if (bi >= 0 && bi < beamCount) beamFinalAng[bi] else 0f
+            val nx = wrap01(dust[o] + cos(dir) * dStep)
+            val ny = wrap01(dust[o + 1] + sin(dir) * dStep)
+            dust[o] = nx
+            dust[o + 1] = ny
+            addDot(dustPaths[dustBucketOf(k)], nx * w, ny * h, dust[o + 3])
+            k++
+        }
+        b = 0
+        while (b < DUST_BUCKETS) {
+            drawPath(dustPaths[b], dustColor, alpha = DUST_ALPHAS[b], blendMode = BlendMode.Plus)
+            b++
+        }
+
+        // ── 中心光核：pulse 脉动 ──
+        val coreR = CORE_R + frame.pulse * CORE_R_PULSE
+        drawCircle(accent, radius = coreR * 1.8f, center = Offset(cx, cy), alpha = 0.12f, blendMode = BlendMode.Plus)
+        drawCircle(accent, radius = coreR, center = Offset(cx, cy), alpha = 0.55f, blendMode = BlendMode.Plus)
+
+        // ── §B10-④ 镜头光斑：交汇处「光晕（1 次 `shadeBrushCached`）+ 六芒（3 条 `drawLine`）」──
+        val flareR = minDim * FLARE_R_K
+        drawCircle(
+            brush = Shading2D.shadeBrushCached(
+                key = (w.toRawBits().toLong() shl 32) xor h.toRawBits().toLong() xor
+                    accent.toArgb().toLong() xor E35_KEY_SALT,
+                center = Offset(cx, cy),
+                radius = flareR,
+                base = flareBase,
+                contrast = 0.55f
+            ),
+            radius = flareR,
+            center = Offset(cx, cy),
+            alpha = 0.45f + frame.pulse * 0.35f,
+            blendMode = BlendMode.Plus
+        )
+        val spoke = flareR * FLARE_SPOKE_K
+        val spin = elapsedSec * FLARE_SPIN
+        var s2 = 0
+        while (s2 < FLARE_SPOKES) {
+            val a = s2 * (TAU / FLARE_SPOKES) + spin
+            val dx = cos(a) * spoke
+            val dy = sin(a) * spoke
+            drawLine(
+                accent, Offset(cx - dx, cy - dy), Offset(cx + dx, cy + dy),
+                strokeWidth = FLARE_SPOKE_W, alpha = 0.30f + frame.pulse * 0.25f,
+                blendMode = BlendMode.Plus
+            )
+            s2++
+        }
+    }
+
+    /**
+     * §B10-① 光束几何 + 4 个渐变 `Brush`（**只在键变化时重建**）。
+     *
+     * 几何一律建在**规范朝向**（自 `(cx, cy)` 沿 `+X` 伸出）—— 逐束旋转交给
+     * `withTransform`（`inline` ⇒ 零分配，§15.4-A7）。若把旋转烘进顶点，就等于
+     * 每帧重建 `Path`（E33 的注释里记过同一取舍）。
+     *
+     * ⚠️ 渐变轴 = **外缘端 → 中心端**（`startR > endR`）⇒ 「起点亮 `alpha 0.42` →
+     * 终点透明」按 §B10-① 的字面语义落在**光束从屏幕边缘射入**的方向上。
+     */
+    private fun ensureBeamGeometry(
+        cx: Float, cy: Float, maxLen: Float, accent: Color, secondary: Color
+    ) {
+        if (beamBody != null && geoCx == cx && geoCy == cy && geoMaxLen == maxLen &&
+            geoAccent == accent && geoSecondary == secondary
+        ) return
+        geoCx = cx; geoCy = cy; geoMaxLen = maxLen
+        geoAccent = accent; geoSecondary = secondary
+
+        val startR = maxLen * START_R_K
+        val endR = maxLen * END_R_K
+        val wNear = maxLen * BEAM_HALF_W_NEAR
+        val wFar = maxLen * BEAM_HALF_W_FAR
+        val cNear = wNear * CORE_W_K
+        val cFar = wFar * CORE_W_K
+
+        val body = Path()
+        body.moveTo(cx + startR, cy - wNear)
+        body.lineTo(cx + endR, cy - wFar)
+        body.lineTo(cx + endR, cy + wFar)
+        body.lineTo(cx + startR, cy + wNear)
+        body.close()
+        beamBody = body
+
+        val core = Path()
+        core.moveTo(cx + startR, cy - cNear)
+        core.lineTo(cx + endR, cy - cFar)
+        core.lineTo(cx + endR, cy + cFar)
+        core.lineTo(cx + startR, cy + cNear)
+        core.close()
+        beamCore = core
+
+        val near = Offset(cx + startR, cy)
+        val far = Offset(cx + endR, cy)
+        bodyBrushA = beamBrush(accent, BEAM_NEAR_ALPHA, near, far)
+        coreBrushA = beamBrush(accent, CORE_NEAR_ALPHA, near, far)
+        bodyBrushB = beamBrush(secondary, BEAM_NEAR_ALPHA, near, far)
+        coreBrushB = beamBrush(secondary, CORE_NEAR_ALPHA, near, far)
+
+        // 碎裂虚线的线宽 ≈ 芯线宽度（旧实现写死 1.8f）
+        dashStroke = Stroke(width = (cNear * 2f).coerceAtLeast(1.2f))
+    }
+
+    /** 沿光束轴的线性渐变：`nearAlpha`（外缘端）→ [BEAM_FAR_ALPHA]（中心端） */
+    private fun beamBrush(base: Color, nearAlpha: Float, near: Offset, far: Offset): Brush =
+        Brush.linearGradient(
+            listOf(base.copy(alpha = nearAlpha), base.copy(alpha = BEAM_FAR_ALPHA)),
+            start = near,
+            end = far
+        )
+
+    /**
+     * 把一个半径 [r] 的**圆点**追加进 [path]（1 `moveTo` + 4 `cubicTo` + `close`）。
+     *
+     * ⛔ 不用 `Path.addOval(Rect(...))` —— Compose 的 `addOval` 只有对象重载、
+     * `Rect` 是 `data class` ⇒ 每点一次堆分配（E19 已踩过）；`android.graphics.Path`
+     * 的 float 重载只存在于 native 侧（§15.4-A4）。
+     * ⛔ 也不用逐点 `drawCircle`（48 次 draw ⇒ 失去 §B10-③ 的合批）。
+     */
+    private fun addDot(path: Path, cx: Float, cy: Float, r: Float) {
+        if (r <= 0.01f) return
+        val k = r * KAPPA
+        path.moveTo(cx + r, cy)
+        path.cubicTo(cx + r, cy + k, cx + k, cy + r, cx, cy + r)
+        path.cubicTo(cx - k, cy + r, cx - r, cy + k, cx - r, cy)
+        path.cubicTo(cx - r, cy - k, cx - k, cy - r, cx, cy - r)
+        path.cubicTo(cx + k, cy - r, cx + r, cy - k, cx + r, cy)
+        path.close()
+    }
+
+    /**
+     * 尘埃色 / 光斑基色（**仅在 `accent` 变化时重算** ⇒ draw 期零分配、零 JNI）。
+     * ⛔ 键就是 `accent` 本身（`Color` 是 `@JvmInline value class` ⇒ `==` 不触发 `toArgb()`）；
+     * 这两个色**只**依赖 accent（不含 w/h / 能量）。
+     */
+    private fun ensureColors(accent: Color) {
+        if (accent == colorAccent) return
+        colorAccent = accent
+        dustColor = VisualizerMath.towardWhite(accent, 0.45f)
+        flareBase = VisualizerMath.towardWhite(accent, 0.55f)
+    }
+}
+

@@ -1,0 +1,1159 @@
+package com.nasmusic.tv.player
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.KeyEvent
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.graphics.drawable.toBitmap
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.CommandButton
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaNotification
+import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
+import coil.Coil
+import coil.request.ImageRequest
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.nasmusic.tv.NasMusicApp
+import com.nasmusic.tv.R
+import com.nasmusic.tv.data.model.Song
+import com.nasmusic.tv.ui.MainActivity
+import com.nasmusic.tv.util.AppLog
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * 后台播放服务
+ * 基于 Media3 MediaLibraryService
+ * 支持前台通知 (D-1)
+ */
+@UnstableApi
+class PlaybackService : MediaLibraryService() {
+
+    private var mediaLibrarySession: MediaLibrarySession? = null
+    private var lastNotificationState: Pair<String?, Boolean>? = null
+    private lateinit var mediaLibraryTree: MediaLibraryTree
+    /**
+     * Android Auto 浏览节点缓存（mediaId → Song）。
+     *
+     * 媒体树加载时写入，播放入口（onSetMediaItems / onAddMediaItems）同步读取——
+     * 那两个回调运行在 Media3 会话线程上，不能在其中做网络 IO。
+     */
+    private val browseCache = BrowseCache()
+
+    /**
+     * 搜索结果短期缓存（阶段 3）。
+     *
+     * ## 为什么需要
+     *
+     * 车机端搜索是**两步**：`onSearch`（只回结果码 + 数量）→ 车机再调
+     * `onGetSearchResult` 取真正的列表。两次都要同一个 query 的结果，
+     * 没有缓存就会**搜两遍**（每次都要打公网 + 可能打内网）。
+     *
+     * ## 为什么不能只靠缓存
+     *
+     * `onGetSearchResult` 的 javadoc 明确写着：query 通常先经 `onSearch`，
+     * **但「may not」** —— 使用 `MediaBrowserCompat#search` 时不会先调 `onSearch`。
+     * 所以缓存未命中时必须**自己搜**，不能假设 `onSearch` 已预热。
+     *
+     * 并发安全：`ConcurrentHashMap`（两个回调都跑在会话的 application looper 上，
+     * 但 `serviceScope.launch` 之后仍在主线程 —— 用并发容器以免依赖该假设）。
+     */
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, SearchCacheEntry>()
+
+    private data class SearchCacheEntry(val atMs: Long, val items: List<MediaItem>)
+    /** A-13：无 UI 的 streamUrl 解析任务（防竞态：新解析取消旧解析） */
+    private var uiResolveJob: Job? = null
+    private var isForeground = false
+    /** 当前歌曲封面 bitmap，由 onMediaItemTransition 异步加载，用于通知 largeIcon */
+    private var cachedArtworkBitmap: Bitmap? = null
+    /** 封面加载协程 */
+    private var artworkLoadJob: Job? = null
+    /** 服务级协程作用域 */
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    /** F2-2：睡眠定时器运行中，通知剩余分钟刷新（分钟粒度 key 并入去重状态） */
+    private var sleepMinuteTickJob: Job? = null
+
+    private val controlReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                ACTION_TOGGLE_PLAY_MODE -> handleTogglePlayMode()
+                ACTION_SLEEP_TIMER_CYCLE -> handleSleepTimerCycle()
+            }
+        }
+    }
+
+    /** F2-2b：切换播放模式（通知按钮 / 系统媒体卡片自定义按钮共用） */
+    private fun handleTogglePlayMode() {
+        AppLog.d("PlaybackService", "control: toggle play mode")
+        // L3：经 app 容器的事件流投递，由 UI 侧执行切换（playMode 真相在 PlayerViewModel）。
+        // 返回 false = 当前无 UI 订阅（Activity 已销毁 / 应用已退出），事件按设计丢弃——
+        // 与旧实现 handler == null 时静默无反应同义，不是故障。
+        if (!(application as NasMusicApp).requestPlayModeToggle()) {
+            AppLog.w("PlaybackService", "control: toggle play mode dropped (no UI subscriber)")
+        }
+        // 强制刷新（模式图标变化）
+        lastNotificationState = null
+        updateNotification()
+    }
+
+    /** F2-2b：睡眠定时循环切换（未启动→首档位，运行中→取消） */
+    private fun handleSleepTimerCycle() {
+        val pm = (application as NasMusicApp).playerManager
+        if (pm.sleepTimer.isRunning()) {
+            pm.sleepTimer.cancel()
+            AppLog.d("PlaybackService", "control: sleep timer cancelled")
+        } else {
+            val minutes = SLEEP_TIMER_PRESETS.first()
+            pm.sleepTimer.start(minutes)
+            AppLog.d("PlaybackService", "control: sleep timer started ${minutes}min")
+        }
+        lastNotificationState = null
+        updateNotification()
+        restartSleepMinuteTick()
+    }
+
+    /**
+     * F2-2b：系统媒体卡片（Android 13+ 锁屏/超级岛/下拉媒体控制）自定义按钮布局。
+     * 系统媒体控制按钮来自 MediaSession custom layout，而非通知 addAction——
+     * 必须通过 SessionCommand + onCustomCommand 供系统 UI 调用。
+     */
+    private fun buildCustomLayout(): ImmutableList<CommandButton> {
+        val pm = (application as NasMusicApp).playerManager
+        val sleepLabel = if (pm.sleepTimer.isRunning()) {
+            getString(R.string.notif_sleep_timer_remaining, pm.sleepTimer.remainingMinutes())
+        } else {
+            getString(R.string.notif_sleep_timer_start)
+        }
+        return ImmutableList.of(
+            CommandButton.Builder()
+                .setDisplayName(getString(R.string.notif_play_mode))
+                .setSessionCommand(SessionCommand(ACTION_TOGGLE_PLAY_MODE, Bundle.EMPTY))
+                .setIconResId(android.R.drawable.ic_menu_rotate)
+                .build(),
+            CommandButton.Builder()
+                .setDisplayName(sleepLabel)
+                .setSessionCommand(SessionCommand(ACTION_SLEEP_TIMER_CYCLE, Bundle.EMPTY))
+                .setIconResId(android.R.drawable.ic_lock_idle_alarm)
+                .build()
+        )
+    }
+
+    /** F2-2b：刷新通知时同步刷新系统媒体卡片的睡眠定时按钮文案 */
+    private fun refreshSessionCustomLayout() {
+        try {
+            mediaLibrarySession?.setCustomLayout(buildCustomLayout())
+        } catch (e: Exception) {
+            AppLog.w("PlaybackService", "setCustomLayout failed", e)
+        }
+    }
+
+    private val playerListener = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isPlaying) {
+                ensureMediaSessionActive()
+            }
+            updateNotification()
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED) {
+                (application as NasMusicApp).playerManager.onPlaybackEnded()
+            }
+            updateNotification()
+        }
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            loadArtworkForCurrentItem()
+            updateNotification()
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        AppLog.d("PlaybackService", "onCreate: starting")
+
+        // F2-2：注册控制广播接收器（playMode/sleepTimer 自定义动作）
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, controlReceiver,
+            android.content.IntentFilter().apply {
+                addAction(ACTION_TOGGLE_PLAY_MODE)
+                addAction(ACTION_SLEEP_TIMER_CYCLE)
+            },
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        // F2-2：睡眠定时到期 → 刷新通知（显示"已到时"状态）
+        (application as NasMusicApp).playerManager.onSleepTimerExpired = {
+            lastNotificationState = null
+            stopSleepMinuteTick()
+            updateNotification()
+        }
+
+        // Create notification channel for Android 8+
+        createNotificationChannel()
+
+        val audioAttributes = AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build()
+
+        // 启用 MP3 seek 支持（解决 HTTP 流 seek 后重置到 0 的问题）
+        // FLAG_ENABLE_INDEX_SEEKING: 为 VBR MP3 建立时间-字节映射索引
+        // FLAG_ENABLE_CONSTANT_BITRATE_SEEKING: 假设 CBR MP3 可通过固定码率计算偏移
+        val extractorsFactory = androidx.media3.extractor.DefaultExtractorsFactory()
+            .setMp3ExtractorFlags(
+                androidx.media3.extractor.mp3.Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING or
+                androidx.media3.extractor.mp3.Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING
+            )
+        // DataSource.Factory：按 URL 域名条件注入百度 dlink 请求头（UA: pan.baidu.com + Referer）
+        // NAS/Meting/百度共同一链路，非百度域名原样透传（BaiduHttpDataSourceFactory 内部判断）
+        val dataSourceFactory = com.nasmusic.tv.backend.network.baidu.BaiduHttpDataSourceFactory.create(this)
+        val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
+
+        // 人声消除处理器（卡拉OK模式）— 频谱遮罩版本
+        // 变量名曾用 vocalRemovalProcessor（历史实现名），2026-09-14 随死代码
+        // VocalRemovalProcessor 一并正名
+        val spectralMaskProcessor = SpectralMaskProcessor()
+
+        // PCM 频谱通道（唯一通道，v2.37.6 起）—— 频谱数据来自 AudioSink 链最前端的
+        // PCM 透传自算 FFT，无需 RECORD_AUDIO 权限（原 Visualizer 通道已移除）。
+        // 挂在链最前，取人声消除之前的原始信号。
+        val pcmFallback = com.nasmusic.tv.player.PcmFallbackChannel()
+
+        // 自定义 RenderersFactory，注入人声消除处理器 SpectralMaskProcessor 到 AudioSink
+        val renderersFactory = object : DefaultRenderersFactory(this) {
+            override fun buildAudioSink(
+                context: android.content.Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink {
+                return DefaultAudioSink.Builder(context)
+                    .setAudioProcessors(arrayOf(pcmFallback.processor, spectralMaskProcessor))
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .build()
+            }
+        }
+
+        val player = ExoPlayer.Builder(this, renderersFactory)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+
+        player.addListener(playerListener)
+
+        // 注入高质量人声分离组件（HT-Demucs FT ONNX 模式）
+        // 注意：模型不在 APK 内，需在设置页下载。初始化延迟到 enableHighQualityRemoval 时（PlayerManager 内部检查模型）
+        val demucsSeparator = DemucsSeparator(this)
+        val accompanimentCache = AccompanimentCache(this)
+
+        // 初始化媒体库树（用于 Android Auto / Wear OS 浏览）
+        mediaLibraryTree = MediaLibraryTree(this, browseCache)
+
+        // Store player reference in manager + inject vocal removal processor
+        // 顺序关键：PCM 频谱通道必须先于 setPlayer 注入 —— setPlayer 内部会触发
+        // initSpectrumAnalyzer→start，start 需要 pcmFallback 已注入。
+        (application as NasMusicApp).playerManager.setPcmFallbackChannel(pcmFallback)
+        (application as NasMusicApp).playerManager.setPlayer(player)
+        // A-13：注册无 UI 依赖的 streamUrl 解析器。
+        // Android Auto / Wear OS / 蓝牙唤起等场景下 MainActivity 可能从未启动，
+        // MainViewModel 注册的 onNeedResolveStreamUrl 为 null，网络歌曲会静默播不出来。
+        // 该解析器优先级高于 UI 侧回调，解析失败时才回落到 UI 侧。
+        (application as NasMusicApp).playerManager.builtinStreamUrlResolver = { index ->
+            resolveStreamUrlWithoutUi(index)
+        }
+        (application as NasMusicApp).playerManager.setVocalRemovalProcessor(spectralMaskProcessor)
+        (application as NasMusicApp).playerManager.setDemucsSeparator(demucsSeparator)
+        (application as NasMusicApp).playerManager.setAccompanimentCache(accompanimentCache)
+
+        // 不在 onCreate 中创建 MediaSession 或 startForeground
+        // MediaSession 和前台通知延迟到首次播放时创建，避免 app 启动即显示锁屏小窗
+        AppLog.d("PlaybackService", "onCreate: player created, MediaSession deferred to first play")
+    }
+
+    /**
+     * 首次播放时创建 MediaSession 并进入前台模式。
+     * 由 Player.Listener.onIsPlayingChanged(isPlaying=true) 触发。
+     * 幂等：已创建则跳过。
+     */
+    private fun ensureMediaSessionActive() {
+        if (mediaLibrarySession != null) return
+
+        AppLog.d("PlaybackService", "ensureMediaSessionActive: creating MediaSession + startForeground")
+
+        val player = (application as NasMusicApp).playerManager.getPlayer() ?: return
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        mediaLibrarySession = MediaLibrarySession.Builder(
+            this, player,
+            object : MediaLibrarySession.Callback {
+                /**
+                 * F2-2b：自定义按钮（播放模式/睡眠定时）经 SessionCommand 下发。
+                 *
+                 * ⛔ **本方法绝不能 `reject()`** —— 这是 v2.36.0「车机蓝牙按键全部失效」的根因
+                 * （见 `docs/technical-overview.md` §10.165）。系统侧（蓝牙 AVRCP / SystemUI / 车机）
+                 * 走的是**框架** `android.media.session.MediaController`，该链路在 Media3 里必然
+                 * 经过 `MediaSessionLegacyStub.tryGetController()` → 本回调；一旦拒绝，Media3 会
+                 * 立即 `onDisconnected` 并**丢弃命令**，暂停/上一曲/下一曲全部静默无效。
+                 *
+                 * 安全边界收敛为「专有命令只下发给可信调用方」，判定与命令集合见
+                 * [MediaSessionAccessPolicy]。
+                 */
+                override fun onConnect(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ): MediaSession.ConnectionResult {
+                    val trusted = isTrustedCaller(session, controller)
+                    return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                        .setAvailableSessionCommands(
+                            MediaSessionAccessPolicy.availableSessionCommands(trusted)
+                        )
+                        .build()
+                }
+
+                override fun onCustomCommand(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    customCommand: SessionCommand,
+                    args: Bundle
+                ): ListenableFuture<SessionResult> {
+                    when (customCommand.customAction) {
+                        ACTION_TOGGLE_PLAY_MODE -> handleTogglePlayMode()
+                        ACTION_SLEEP_TIMER_CYCLE -> handleSleepTimerCycle()
+                    }
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
+
+                /**
+                 * 媒体库根节点。
+                 *
+                 * 从 root hints 读取根菜单上限（Android Auto / AAOS 通过它下发，官方默认 4）。
+                 * ⚠️ 必须立即返回，不得在此做网络 IO —— 官方明确要求，否则调用方超时。
+                 *
+                 * 关于常量来源：官方文档给的是 `androidx.media.utils.MediaConstants
+                 * .BROWSER_ROOT_HINTS_KEY_ROOT_CHILDREN_LIMIT`，但那来自 `androidx.media:media`，
+                 * 而本项目对该库只有 **runtime scope 的传递依赖**（经 `media3-session` 引入），
+                 * compile 期不可见。Media3 自己已把**同一个字符串**别名导出为
+                 * `MediaConstants.EXTRAS_KEY_ROOT_CHILDREN_LIMIT`
+                 * （源码级证据：`media3-session-1.2.1` 的 `MediaConstants.java:397-398`
+                 * 就是 `= androidx.media.utils.MediaConstants.BROWSER_ROOT_HINTS_KEY_ROOT_CHILDREN_LIMIT`），
+                 * 故此处用 Media3 的别名，**不新增依赖**。
+                 *
+                 * `..._SUPPORTED_FLAGS` 一项有意不设置：其默认值即 `FLAG_BROWSABLE`，
+                 * 而本应用根菜单 4 项**全部是**可浏览节点，显式设置是 no-op。
+                 */
+                override fun onGetLibraryRoot(
+                    session: MediaLibrarySession,
+                    controller: MediaSession.ControllerInfo,
+                    params: MediaLibraryService.LibraryParams?
+                ): ListenableFuture<LibraryResult<MediaItem>> {
+                    val limit = params?.extras?.getInt(
+                        MediaConstants.EXTRAS_KEY_ROOT_CHILDREN_LIMIT,
+                        MediaLibraryTree.DEFAULT_ROOT_LIMIT
+                    ) ?: MediaLibraryTree.DEFAULT_ROOT_LIMIT
+                    mediaLibraryTree.rootChildrenLimit = limit
+                    return Futures.immediateFuture(
+                        LibraryResult.ofItem(mediaLibraryTree.getLibraryRoot(), params)
+                    )
+                }
+
+                /** 单个节点。只读内存，不触发网络请求。 */
+                override fun onGetItem(
+                    session: MediaLibrarySession,
+                    controller: MediaSession.ControllerInfo,
+                    mediaId: String
+                ): ListenableFuture<LibraryResult<MediaItem>> {
+                    val item = mediaLibraryTree.getItem(mediaId)
+                    return if (item != null) {
+                        Futures.immediateFuture(LibraryResult.ofItem(item, null))
+                    } else {
+                        Futures.immediateFuture(LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE))
+                    }
+                }
+
+                /**
+                 * 子节点列表。
+                 *
+                 * ⚠️ 两个关键点：
+                 * 1. **不依赖 page / pageSize** —— Android Auto 与 AAOS 官方明确不支持分页，
+                 *    该参数不可靠（旧实现据此切片会导致列表被静默截断）。
+                 * 2. **必须异步** —— 树加载会访问 NAS 等网络资源，同步实现会阻塞会话线程导致 ANR。
+                 */
+                override fun onGetChildren(
+                    session: MediaLibrarySession,
+                    controller: MediaSession.ControllerInfo,
+                    parentId: String,
+                    page: Int,
+                    pageSize: Int,
+                    params: MediaLibraryService.LibraryParams?
+                ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+                    val future = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+                    serviceScope.launch {
+                        try {
+                            val children = withTimeoutOrNull(BROWSE_TIMEOUT_MS) {
+                                mediaLibraryTree.loadChildren(parentId)
+                            }.orEmpty()
+                            future.set(LibraryResult.ofItemList(ImmutableList.copyOf(children), params))
+                        } catch (e: Exception) {
+                            // 超时/异常返回空列表：宁可显示为空，也不要让车机端一直转圈
+                            AppLog.w("PlaybackService", "onGetChildren($parentId) failed", e)
+                            future.set(LibraryResult.ofItemList(ImmutableList.of(), params))
+                        }
+                    }
+                    return future
+                }
+
+                /**
+                 * 车机端搜索（阶段 3）：本方法只回**结果码**，列表由 [onGetSearchResult] 提供。
+                 *
+                 * 源码依据 `MediaLibraryService.java:342-348` 的 javadoc —— 两步流程：
+                 * 本方法返回一个结果码，并通过 `notifySearchResultChanged` 通知**结果数量**；
+                 * 随后 `MediaBrowser` 才会来调 `onGetSearchResult` 取真正的列表。
+                 *
+                 * ⚠️ **只返回结果码而不通知数量，车机端不会来取结果** —— 表现为「搜了但列表空」。
+                 */
+                override fun onSearch(
+                    session: MediaLibrarySession,
+                    browser: MediaSession.ControllerInfo,
+                    query: String,
+                    params: MediaLibraryService.LibraryParams?
+                ): ListenableFuture<LibraryResult<Void>> {
+                    val future = SettableFuture.create<LibraryResult<Void>>()
+                    serviceScope.launch {
+                        try {
+                            val items = searchItemsCached(query)
+                            session.notifySearchResultChanged(browser, query, items.size, params)
+                            future.set(LibraryResult.ofVoid(params))
+                        } catch (e: Exception) {
+                            AppLog.w("PlaybackService", "onSearch('$query') failed", e)
+                            future.set(
+                                LibraryResult.ofError(LibraryResult.RESULT_ERROR_UNKNOWN, params)
+                            )
+                        }
+                    }
+                    return future
+                }
+
+                /**
+                 * 车机端搜索：返回结果列表。
+                 *
+                 * ⚠️ 两个关键点（均有源码依据）：
+                 * 1. **不能假设 `onSearch` 已先被调用** —— javadoc（`MediaLibraryService.java:365-367`）
+                 *    写明 query「may not」先经 `onSearch`（走 `MediaBrowserCompat#search` 时不会）。
+                 *    所以本方法**必须能独立搜索**，[searchCache] 只是省一次重复搜索的优化。
+                 * 2. **忽略 page / pageSize** —— 与 [onGetChildren] 同源理由：Android Auto / AAOS
+                 *    官方不支持分页，该参数不可靠。
+                 *
+                 * 异常时返回**空列表**而非错误码 —— javadoc 明确要求
+                 * 「Return an empty list for no children rather than using error codes」。
+                 */
+                override fun onGetSearchResult(
+                    session: MediaLibrarySession,
+                    browser: MediaSession.ControllerInfo,
+                    query: String,
+                    page: Int,
+                    pageSize: Int,
+                    params: MediaLibraryService.LibraryParams?
+                ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+                    val future = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+                    serviceScope.launch {
+                        try {
+                            val items = searchItemsCached(query)
+                            future.set(LibraryResult.ofItemList(ImmutableList.copyOf(items), params))
+                        } catch (e: Exception) {
+                            AppLog.w("PlaybackService", "onGetSearchResult('$query') failed", e)
+                            future.set(LibraryResult.ofItemList(ImmutableList.of(), params))
+                        }
+                    }
+                    return future
+                }
+
+                /**
+                 * 播放入口之一：URI 解析器。
+                 *
+                 * 浏览树里的叶子节点只带 mediaId、**不带 URI**（见 MediaLibraryTree），
+                 * 由本回调解析出可播放 URI。这是 Media3 官方设计的 URI 解析入口。
+                 *
+                 * ⚠️ 必须覆写：默认实现在 item 缺 LocalConfiguration（URI）时会抛
+                 * `UnsupportedOperationException`。
+                 * ⚠️ 返回值不能为 null —— Media3 内部 checkNotNull 会直接抛 NPE。
+                 */
+                override fun onAddMediaItems(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    mediaItems: MutableList<MediaItem>
+                ): ListenableFuture<MutableList<MediaItem>> = resolveItems(mediaItems)
+
+                /**
+                 * 播放入口之二：车机点歌的统一入口。
+                 *
+                 * 覆写本方法后，legacy 的 playFromMediaId / playFromUri 等路径也会汇聚到这里
+                 * （Media3 官方 javadoc），因此它是唯一的点歌拦截点。
+                 *
+                 * ⚠️ 三条铁律（均经 media3-session-1.2.1 源码确认）：
+                 * 1. 返回值**不能为 null** —— MediaSessionImpl 有 checkNotNull，返回 null 直接 NPE。
+                 * 2. 返回值会被 Media3 用于 `player.setMediaItems()`
+                 *    （MediaUtils.setMediaItemsWithStartIndexAndPosition），
+                 *    故此处**不得再调用 playerManager.playQueue()**，否则会造成重复设置。
+                 * 3. 覆写后成为所有点歌路径的统一入口。
+                 *
+                 * 因此这里只做两件事：同步 PlayerManager 状态镜像 + 解析 URI 后返回。
+                 * player 的设置与随后的 prepare/play 均由 Media3 完成。
+                 */
+                override fun onSetMediaItems(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    mediaItems: MutableList<MediaItem>,
+                    startIndex: Int,
+                    startPositionMs: Long
+                ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                    // ── 0) 语音搜索入口（阶段 3）：必须最先拦截 ──────────────────
+                    //
+                    // Google 助理「播放 XXX」**不走** onPlayFromSearch —— Media3 根本没有这个回调
+                    // （javap 实测 MediaSession$Callback 的 11 个 default 方法里无搜索相关）。
+                    // 它实际经 MediaSessionLegacyStub.onPlayFromSearch → handleMediaRequest → 本方法，
+                    // 参数为：
+                    //   items            = [MediaItem(mediaId = "", requestMetadata.searchQuery = query)]
+                    //   startIndex       = C.INDEX_UNSET(-1)
+                    //   startPositionMs  = C.TIME_UNSET
+                    // 源码（media3-session-1.2.1）：
+                    //   MediaSessionLegacyStub.java:395（onPlayFromSearch）
+                    //   MediaSessionLegacyStub.java:811-817（handleMediaRequest）
+                    //   MediaSessionLegacyStub.java:947-961（createMediaItemForMediaRequest）
+                    // 其中 mediaId 用的是 MediaItem.DEFAULT_MEDIA_ID，源码确认其值为 ""（MediaItem.java:2196）。
+                    //
+                    // 因此判定条件 =「mediaId 为空 且 searchQuery 非空」。
+                    val voiceQuery = mediaItems.firstOrNull()
+                        ?.takeIf { it.mediaId.isBlank() }
+                        ?.requestMetadata?.searchQuery?.toString()
+                        ?.takeIf { it.isNotBlank() }
+                    if (voiceQuery != null) {
+                        return resolveVoiceSearch(voiceQuery)
+                    }
+
+                    // 1) 状态镜像回流（不碰 player）—— 修复「队列与当前歌不一致」的根因。
+                    //    必须完整还原才同步：否则 queue 会比 playlist 短，导致索引错位。
+                    val songs = browseCache.songsOf(mediaItems.map { it.mediaId })
+                    if (songs.isNotEmpty() && songs.size == mediaItems.size) {
+                        (application as NasMusicApp)
+                            .playerManager.syncQueueFromExternal(songs, startIndex)
+                    } else {
+                        AppLog.w(
+                            "PlaybackService",
+                            "onSetMediaItems: resolved ${songs.size}/${mediaItems.size}, skip state sync"
+                        )
+                    }
+
+                    // 2) 解析 URI 后返回，由 Media3 设置 player 并自动 prepare + play
+                    val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+                    serviceScope.launch {
+                        val resolved = try {
+                            resolveItemsSuspend(mediaItems)
+                        } catch (e: Exception) {
+                            AppLog.w("PlaybackService", "onSetMediaItems resolve failed", e)
+                            mediaItems
+                        }
+                        future.set(
+                            MediaSession.MediaItemsWithStartPosition(
+                                resolved, startIndex, startPositionMs
+                            )
+                        )
+                    }
+                    return future
+                }
+            }
+        )
+            .setSessionActivity(pendingIntent)
+            .setBitmapLoader(CoilBitmapLoader(Coil.imageLoader(this), this))
+            .build()
+
+        // F2-2b：系统媒体卡片（锁屏/超级岛/下拉媒体控制）自定义按钮布局
+        mediaLibrarySession?.setCustomLayout(buildCustomLayout())
+
+        // F2-2b：接管 MediaNotification Provider——消除 media3 默认通知与自建通知（同为 ID=1）
+        // 互相覆盖导致的"按钮不刷新"问题；统一由本服务 buildNotification 渲染 5 按钮。
+        setMediaNotificationProvider(object : MediaNotification.Provider {
+            override fun createNotification(
+                session: MediaSession,
+                customLayout: ImmutableList<CommandButton>,
+                actionFactory: MediaNotification.ActionFactory,
+                onNotificationChangedCallback: MediaNotification.Provider.Callback
+            ): MediaNotification {
+                val isPlaying = session.player.isPlaying
+                return MediaNotification(
+                    NOTIFICATION_ID,
+                    buildNotification(
+                        session.player.currentMediaItem?.mediaMetadata?.title?.toString(),
+                        isPlaying
+                    )
+                )
+            }
+
+            override fun handleCustomCommand(
+                session: MediaSession,
+                action: String,
+                extras: Bundle
+            ): Boolean {
+                return when (action) {
+                    ACTION_TOGGLE_PLAY_MODE, ACTION_SLEEP_TIMER_CYCLE -> true
+                    else -> false
+                }
+            }
+        })
+
+        // 进入前台模式 + 显示通知
+        startForeground(NOTIFICATION_ID, buildNotification(null, false))
+        isForeground = true
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
+        return mediaLibrarySession
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Android Auto：URI 解析与调用方校验
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * 把浏览树节点解析为可播放的 [MediaItem]。
+     *
+     * 解析策略（按成本从低到高）：
+     * 1. item 已带 URI（控制器直接给了直链）→ 原样返回
+     * 2. `Song.streamUrl` 非空（NAS 浏览时已填充 / 本地文件）→ 零成本，直接构造
+     * 3. 否则调 `NetworkMusicManager.resolvePlayUrl()`（网络歌曲 / 百度网盘）
+     *
+     * 第 3 步走**公网**，与家庭内网无关，因此车机场景下依然可用。
+     * 解析失败时返回原 item（无 URI），由播放时的兜底逻辑处理，不抛异常。
+     */
+    private suspend fun resolveItemsSuspend(items: List<MediaItem>): List<MediaItem> =
+        withContext(Dispatchers.IO) {
+            val app = application as NasMusicApp
+            items.map { item ->
+                if (item.localConfiguration != null) return@map item
+                val song = browseCache.songOf(item.mediaId) ?: return@map item
+
+                val url = song.streamUrl?.takeIf { it.isNotBlank() }
+                    ?: withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+                        runCatching { app.networkMusicManager.resolvePlayUrl(song) }.getOrNull()
+                    }
+
+                if (url.isNullOrBlank()) {
+                    AppLog.w("PlaybackService", "resolveItems: no url for ${song.title}")
+                    item
+                } else {
+                    app.playerManager.buildMediaItem(song, url)
+                }
+            }
+        }
+
+    /**
+     * [resolveItemsSuspend] 的 ListenableFuture 包装。
+     *
+     * ⚠️ 无论成功失败都**必须** set 一个非 null 值：Media3 对这两个回调的返回值有
+     * `checkNotNull` 断言，返回 null 会直接抛 NPE（见开发方案 §4.2 铁律 1）。
+     */
+    private fun resolveItems(items: List<MediaItem>): ListenableFuture<MutableList<MediaItem>> {
+        val future = SettableFuture.create<MutableList<MediaItem>>()
+        serviceScope.launch {
+            val resolved = try {
+                resolveItemsSuspend(items)
+            } catch (e: Exception) {
+                AppLog.w("PlaybackService", "resolveItems failed", e)
+                items
+            }
+            future.set(resolved.toMutableList())
+        }
+        return future
+    }
+
+    /**
+     * 语音搜索 → 可播放列表（阶段 3）。
+     *
+     * ## 三条硬约束（前两条有源码依据）
+     *
+     * 1. **返回值不能为 null** —— `MediaSessionImpl.java:687-696` 有
+     *    `checkNotNull(..., "Callback.onSetMediaItems must return a non-null future")`。
+     * 2. **`startIndex` / `startPositionMs` 归一成 `0` / `0L`** —— 传进来的是
+     *    `C.INDEX_UNSET` / `C.TIME_UNSET`，而这两个值指的是**被替换掉的旧 item 列表**；
+     *    我们返回的是**全新的搜索结果列表**，沿用旧索引没有意义。
+     *    （`MediaUtils.setMediaItemsWithStartIndexAndPosition`（`MediaUtils.java:194-213`）
+     *    对 `INDEX_UNSET` 恰好会走 `setMediaItems(items, resetPosition=true)`，行为等价 ——
+     *    但显式写 `0` / `0L` 才是**无歧义**的表达，也避免日后若有调用方传入真实索引时
+     *    索引到错误的列表。**注意：这不是在修 bug，是在消除歧义。**）
+     * 3. **item 必须带 URI**，否则 ExoPlayer 播不出来 → 复用 [resolveItemsSuspend]。
+     *
+     * ## 搜不到时为什么让 future **失败**，而不是返回空列表
+     *
+     * 返回空列表会被 Media3 拿去调 `player.setMediaItems(emptyList(), 0, 0L)` ——
+     * **清空播放队列、打断用户正在听的歌**。而让 future 失败时：
+     * - **legacy（语音）路径**：`MediaSessionLegacyStub.handleMediaRequest` 的 `onFailure`
+     *   明确写着 *"Do nothing, the session is free to ignore these requests"*
+     *   （源码 `:843-846`）→ **当前播放完全不受影响**；
+     * - **现代路径**：`MediaSessionStub.sendSessionResultWhenReady` 把异常转成错误结果回给
+     *   控制器（源码 `:192-198`），不会崩。
+     *
+     * 即「搜不到就什么都不做」，比「搜不到就把用户正在听的歌停掉」合理得多。
+     */
+    private fun resolveVoiceSearch(
+        query: String
+    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+        val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+        serviceScope.launch {
+            val resolved = try {
+                resolveItemsSuspend(searchItemsCached(query))
+            } catch (e: Exception) {
+                AppLog.w("PlaybackService", "resolveVoiceSearch('$query') failed", e)
+                emptyList()
+            }
+
+            if (resolved.isEmpty()) {
+                // 搜不到 → 失败而非空列表，保住当前播放（见方法注释）
+                AppLog.i("PlaybackService", "resolveVoiceSearch('$query'): no playable result")
+                future.setException(IllegalStateException("no result for query: $query"))
+            } else {
+                AppLog.i("PlaybackService", "resolveVoiceSearch('$query'): ${resolved.size} items")
+                future.set(MediaSession.MediaItemsWithStartPosition(resolved, 0, 0L))
+            }
+        }
+        return future
+    }
+
+    /**
+     * 搜索（阶段 3）：带短期缓存 + 超时。
+     *
+     * 超时 / 异常一律返回**空列表**（不抛异常），由调用方决定「空结果」的语义 ——
+     * 两个调用点的处理**不同且都有意为之**：
+     * - `onSearch` / `onGetSearchResult` → 返回空列表（车机端显示"无结果"）
+     * - `onSetMediaItems`（语音点歌）→ **让 future 失败**，避免清空播放队列（见该方法注释）
+     */
+    private suspend fun searchItemsCached(query: String): List<MediaItem> {
+        val q = query.trim()
+        if (q.isEmpty()) return emptyList()
+
+        val now = SystemClock.elapsedRealtime()
+        searchCache[q]?.let { if (now - it.atMs < SEARCH_CACHE_TTL_MS) return it.items }
+
+        val items = withTimeoutOrNull(SEARCH_TIMEOUT_MS) { mediaLibraryTree.search(q) }.orEmpty()
+
+        // 顺手清理过期条目，避免缓存无界增长（与 NetworkMusicManager.playUrlCache 同做法）
+        searchCache.entries.removeAll { now - it.value.atMs >= SEARCH_CACHE_TTL_MS }
+        searchCache[q] = SearchCacheEntry(now, items)
+        return items
+    }
+
+    /**
+     * 调用方可信判定 —— **只用于决定「要不要下发本应用专有的自定义命令」**。
+     *
+     * ⚠️ 它**不再**参与「是否接受连接」的决策（那正是 §10.165 车机按键失效的根因）：
+     * 连接一律接受，见 [MediaSessionAccessPolicy] 的类注释。
+     *
+     * 判定与放行范围全部收敛在 [MediaSessionAccessPolicy.isTrustedCaller]（纯函数、有单测）：
+     * 系统 uid / 本应用自身 / Media3 判定的 AAOS 与 Android Auto 控制器 /
+     * Google 助理与 Gemini 包名；DEBUG 构建全放行（便于 DHU 调试自定义按钮）。
+     *
+     * ⚠️ Media3 的 `isAutomotiveController` / `isAutoCompanionController` 官方标注
+     * "not a security validation"（只比包名、不校验签名）。对个人音乐应用该强度足够；
+     * 若日后需要签名级校验，可对照官方 assistant 文档给出的证书指纹实现。
+     */
+    private fun isTrustedCaller(
+        session: MediaSession,
+        controller: MediaSession.ControllerInfo
+    ): Boolean = MediaSessionAccessPolicy.isTrustedCaller(
+        MediaSessionAccessPolicy.CallerIdentity(
+            uid = controller.uid,
+            packageName = controller.packageName,
+            isSelfPackage = controller.packageName == packageName,
+            isMedia3Automotive = session.isAutomotiveController(controller),
+            isMedia3AutoCompanion = session.isAutoCompanionController(controller),
+        ),
+        debug = com.nasmusic.tv.BuildConfig.DEBUG,
+    )
+
+    /**
+     * 无 UI 依赖的 streamUrl 解析（A-13）。
+     *
+     * ## 背景
+     *
+     * `PlayerManager.onNeedResolveStreamUrl` 的实现注册在 `MainViewModel`，而
+     * Android Auto / Wear OS / 蓝牙唤起等场景下 MainActivity 可能**从未启动** →
+     * 回调为 null → 队列中的网络歌曲**静默播不出来**。
+     *
+     * ## 行为
+     *
+     * 解析成功 → 回写队列 → 续播；解析失败 → 回落 UI 侧回调（若存在），由其重试/跳曲。
+     * 解析本身走公网（Meting 等），与家庭内网无关，车机场景下可用。
+     *
+     * @return true 已接管本次解析；false 表示无法处理，由 PlayerManager 回落
+     */
+    private fun resolveStreamUrlWithoutUi(index: Int): Boolean {
+        // 2026-09-26 修复（High #6 残留）：任何新的解析请求都先取消在途 job。
+        // 原实现 cancel 位于 streamUrl 非空提前 return 之后——切到已有 URL 的歌曲时
+        // 旧 job 不被取消，解析完成仍会通过 replayAt 强切回旧歌。
+        uiResolveJob?.cancel()
+        val app = application as NasMusicApp
+        val song = app.playerManager.getQueueSnapshot().getOrNull(index) ?: return false
+        if (!song.streamUrl.isNullOrBlank()) return false
+
+        uiResolveJob = serviceScope.launch {
+            val url = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+                runCatching { app.networkMusicManager.resolvePlayUrl(song) }.getOrNull()
+            }
+            if (url.isNullOrBlank()) {
+                // 2026-09-26 修复（High #6 残留补充）：job 被 cancel() 后，runCatching 会吞掉
+                // CancellationException 走进此分支——此时不得再用旧 index 回落重解析（会与用户
+                // 当前所在歌曲冲突）。被取消则直接退出，由发起方（新请求/切歌路径）自行处理。
+                if (!isActive) return@launch
+                AppLog.w("PlaybackService", "resolveStreamUrlWithoutUi failed: ${song.title}")
+                // 回落 UI 侧（可能为 null）：由其负责重试与自动跳曲
+                app.playerManager.onNeedResolveStreamUrl?.invoke(index)
+                return@launch
+            }
+            // 2026-09-25 审查修复（#8 resolve→replay 竞态）：解析窗口内用户可能切歌/清空队列，
+            // updateStreamUrl/replayAt 只按 index 定位，会把结果写到另一首歌上并强切播放。
+            // 回写前校验目标位置仍是当初发起解析的歌曲，不一致则丢弃。
+            if (app.playerManager.getQueueSnapshot().getOrNull(index)?.id != song.id) {
+                AppLog.d("PlaybackService", "resolveStreamUrlWithoutUi: queue changed during resolve, drop result for ${song.title}")
+                return@launch
+            }
+            app.playerManager.updateStreamUrl(index, url)
+            app.playerManager.replayAt(index)
+        }
+        return true
+    }
+
+    override fun onDestroy() {
+        AppLog.d("PlaybackService", "onDestroy: cleaning up")
+        try { unregisterReceiver(controlReceiver) } catch (_: Exception) {}
+        stopSleepMinuteTick()
+        serviceScope.cancel()
+        browseCache.clear()
+        // 释放 PlayerManager 资源（Handler、listener），防止内存泄漏
+        try {
+            (application as NasMusicApp).playerManager.release()
+        } catch (e: Exception) {
+            AppLog.w("PlaybackService", "PlayerManager.release failed", e)
+        }
+        // 释放 MediaSession（先释放 Session 再释放 Player，防止发布后资源竞争）
+        mediaLibrarySession?.run {
+            release()
+            player.release()
+        }
+        mediaLibrarySession = null
+        // 移除前台通知
+        if (isForeground) {
+            try {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            } catch (e: Exception) {
+                AppLog.w("PlaybackService", "stopForeground failed", e)
+            }
+            isForeground = false
+        }
+        super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 用户从最近任务列表移除应用时：
+        // - 播放中 → 继续播放（不退出）
+        // - 已暂停 → 停止服务
+        val player = mediaLibrarySession?.player
+        val isPlaying = player?.isPlaying == true
+        AppLog.d("PlaybackService", "onTaskRemoved: isPlaying=$isPlaying, hasSession=${mediaLibrarySession != null}")
+        if (isPlaying) {
+            // 播放中移除任务栏：继续播放，不退出服务
+            return
+        }
+        // 已暂停或未播放：停止服务
+        stopSelf()
+    }
+
+    private fun createNotificationChannel() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.playback_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = getString(R.string.playback_channel_desc)
+            setShowBadge(false)
+        }
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(channel)
+    }
+
+    /**
+     * 异步加载当前歌曲封面 bitmap，加载完成后刷新通知。
+     * 首次显示时通知可能无封面，加载完成后 lastNotificationState 被重置以强制刷新。
+     */
+    private fun loadArtworkForCurrentItem() {
+        val mediaItem = mediaLibrarySession?.player?.currentMediaItem
+        val artworkUri = mediaItem?.mediaMetadata?.artworkUri
+        if (artworkUri == null) {
+            cachedArtworkBitmap = null
+            return
+        }
+        artworkLoadJob?.cancel()
+        // L10 修复（2026-10-06，代码审查报告 §5）：捕获发起时的 mediaId，Coil 返回后
+        // 校验当前播放项仍是发起时的那一首才写入 cachedArtworkBitmap——旧实现
+        // Coil 返回(:942)到赋值(:946)之间无守卫，切歌竞态下通知会持续显示上一首封面。
+        val originMediaId = mediaItem?.mediaId
+        artworkLoadJob = serviceScope.launch(Dispatchers.IO) {
+            try {
+                val result = Coil.imageLoader(this@PlaybackService).execute(
+                    ImageRequest.Builder(this@PlaybackService)
+                        .data(artworkUri)
+                        .size(256)
+                        .allowHardware(false)
+                        .build()
+                )
+                val drawable = result.drawable
+                val bitmap = drawable?.toBitmap()
+                if (bitmap != null && isActive &&
+                    mediaLibrarySession?.player?.currentMediaItem?.mediaId == originMediaId
+                ) {
+                    cachedArtworkBitmap = bitmap
+                    // 重置去重状态，强制下次 updateNotification 重建通知（含新封面）
+                    lastNotificationState = null
+                    serviceScope.launch(Dispatchers.Main) {
+                        updateNotification()
+                    }
+                }
+            } catch (e: Exception) {
+                AppLog.w("PlaybackService", "loadArtwork failed: ${e.message}")
+            }
+        }
+    }
+
+    // ⛔ 豁免依据（方案 §9.6，v2.38.3 权限瘦身后显式声明）：Android 13+ 的
+    // POST_NOTIFICATIONS 运行时权限对「媒体会话通知」豁免（MediaStyle + setMediaSession
+    // 模板，见 buildNotification 内注释）——本通知属豁免范畴，无需声明/申请权限。
+    // lint 的 NotificationPermission 检查器不实现该豁免（已知限制），故方法级压制。
+    @android.annotation.SuppressLint("NotificationPermission")
+    private fun updateNotification() {
+        val session = mediaLibrarySession ?: return
+        val player = session.player
+        val currentMediaItem = player.currentMediaItem
+        val title = currentMediaItem?.mediaMetadata?.title?.toString()
+            ?: currentMediaItem?.mediaId
+            ?: "NAS Music TV"
+        val isPlaying = player.isPlaying
+
+        // 比较 (title, isPlaying) 元组，避免暂停/播放状态不刷新
+        val stateKey = title to isPlaying
+        if (stateKey == lastNotificationState) return
+        lastNotificationState = stateKey
+
+        val notification = buildNotification(title, isPlaying)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, notification)
+        // F2-2b：同步刷新系统媒体卡片的睡眠定时按钮剩余分钟
+        refreshSessionCustomLayout()
+    }
+
+    private fun buildNotification(title: String?, isPlaying: Boolean): Notification {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        // 媒体控制按钮（通过 ACTION_MEDIA_BUTTON + KeyEvent 转发给 MediaSession）
+        val playPauseKeyCode =
+            if (isPlaying) KeyEvent.KEYCODE_MEDIA_PAUSE else KeyEvent.KEYCODE_MEDIA_PLAY
+        val playPauseAction = NotificationCompat.Action.Builder(
+            if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+            if (isPlaying) getString(R.string.playback_paused) else getString(R.string.playback_playing),
+            buildMediaButtonPendingIntent(playPauseKeyCode)
+        ).build()
+
+        val prevAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_media_previous,
+            getString(R.string.playback_previous),
+            buildMediaButtonPendingIntent(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        ).build()
+
+        val nextAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_media_next,
+            getString(R.string.playback_next),
+            buildMediaButtonPendingIntent(KeyEvent.KEYCODE_MEDIA_NEXT)
+        ).build()
+
+        // F2-2：播放模式循环切换（自定义 action 广播，无系统键码语义）
+        val pm = (application as NasMusicApp).playerManager
+        val playModeAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_menu_rotate,
+            getString(R.string.notif_play_mode),
+            buildControlPendingIntent(ACTION_TOGGLE_PLAY_MODE, RC_PLAY_MODE)
+        ).build()
+
+        // F2-2：睡眠定时（运行中显示剩余分钟，点击循环 开启→取消）
+        val sleepRunning = pm.sleepTimer.isRunning()
+        val sleepLabel = if (sleepRunning) {
+            getString(R.string.notif_sleep_timer_remaining, pm.sleepTimer.remainingMinutes())
+        } else {
+            getString(R.string.notif_sleep_timer_start)
+        }
+        val sleepAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_lock_idle_alarm,
+            sleepLabel,
+            buildControlPendingIntent(ACTION_SLEEP_TIMER_CYCLE, RC_SLEEP_TIMER)
+        ).build()
+
+        // contentText 显示歌手名（播放状态由 MediaStyle 图标隐含）
+        val artist = mediaLibrarySession?.player?.currentMediaItem?.mediaMetadata?.artist?.toString()
+
+        // F2-2：下一首 subText（队尾/无队列不显示）
+        val nextUpText = nextSongTitle()
+
+        // ⛔ 运行时通知权限豁免的**唯一依据**（2026-10-06 权限瘦身，方案 §2.3）：
+        //    本 App 未声明通知权限，全仓唯一的通知就是这条媒体通知 —— 平台对
+        //    「MediaStyle + setMediaSession」的 MediaSession 通知强制豁免
+        //    （AOSP NotificationManagerService 按 isMediaNotification() 放行）。
+        //    ⚠️ 改这里的通知构造（去掉 setStyle MediaStyle / setMediaSession，
+        //    或新增任何**非媒体**通知）会连带失去豁免 ⇒ 通知在 Android 13+ 上静默不显示。
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title ?: "NAS Music TV")
+            .setContentText(artist)
+            .setSubText(nextUpText)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .also { builder -> cachedArtworkBitmap?.let { builder.setLargeIcon(it) } }
+            .setContentIntent(pendingIntent)
+            .addAction(prevAction)
+            .addAction(playPauseAction)
+            .addAction(nextAction)
+            .addAction(playModeAction)
+            .addAction(sleepAction)
+            .setStyle(
+                androidx.media.app.NotificationCompat.MediaStyle()
+                    .setMediaSession(mediaLibrarySession?.sessionCompatToken)
+                    // compact view 只显示核心 3 键：prev(0), play/pause(1), next(2)
+                    // （修复：原 (1,2,3) 实际显示 play/pause、next、playMode，漏掉 prev）
+                    .setShowActionsInCompactView(0, 1, 2)
+            )
+            .setOngoing(isPlaying)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSilent(true)
+            .build()
+    }
+
+    /** F2-2：下一首标题（队尾或无队列返回 null） */
+    private fun nextSongTitle(): String? {
+        val pm = (application as NasMusicApp).playerManager
+        val queue = pm.getQueueSnapshot()
+        if (queue.isEmpty()) return null
+        val nextIndex = pm.playerState.value.currentIndex + 1
+        val next = queue.getOrNull(nextIndex) ?: return null
+        return getString(R.string.notif_next_up, next.title)
+    }
+
+    /** F2-2：自定义控制动作 PendingIntent（定向本服务内 receiver） */
+    private fun buildControlPendingIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(action).setClass(this, PlaybackService::class.java)
+        return PendingIntent.getBroadcast(
+            this, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    /** F2-2：睡眠定时运行期间每分钟刷新通知剩余分钟 */
+    private fun restartSleepMinuteTick() {
+        stopSleepMinuteTick()
+        val pm = (application as NasMusicApp).playerManager
+        if (!pm.sleepTimer.isRunning()) return
+        sleepMinuteTickJob = serviceScope.launch {
+            while (pm.sleepTimer.isRunning()) {
+                kotlinx.coroutines.delay(60_000)
+                lastNotificationState = null
+                updateNotification()
+                refreshSessionCustomLayout()
+            }
+        }
+    }
+
+    private fun stopSleepMinuteTick() {
+        sleepMinuteTickJob?.cancel()
+        sleepMinuteTickJob = null
+    }
+
+    /**
+     * 构建媒体按钮 PendingIntent
+     * 通过 ACTION_MEDIA_BUTTON Intent + KeyEvent 转发控制指令到 MediaSession
+     * MediaLibraryService.onStartCommand 会自动处理此 Intent 并调用对应的 Player 方法
+     * 注意：用 PendingIntent.getService 而非 getBroadcast，否则无人接收
+     */
+    private fun buildMediaButtonPendingIntent(keyCode: Int): PendingIntent {
+        val keyEvent = KeyEvent(KeyEvent.ACTION_DOWN, keyCode)
+        val intent = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+            setClass(this@PlaybackService, PlaybackService::class.java)
+            putExtra(Intent.EXTRA_KEY_EVENT, keyEvent)
+        }
+        return PendingIntent.getService(
+            this, keyCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "nas_music_playback"
+        private const val NOTIFICATION_ID = 1
+        // 动作名唯一来源 = MediaSessionAccessPolicy（同一字符串既做通知按钮的广播 action，
+        // 又做系统媒体卡片的 SessionCommand action）。此处只做别名，避免两处硬编码漂移。
+        private const val ACTION_TOGGLE_PLAY_MODE = MediaSessionAccessPolicy.ACTION_TOGGLE_PLAY_MODE
+        private const val ACTION_SLEEP_TIMER_CYCLE = MediaSessionAccessPolicy.ACTION_SLEEP_TIMER_CYCLE
+
+        // ── Android Auto ──
+        /** 媒体树加载超时：NAS 不可达时避免车机端一直转圈 */
+        private const val BROWSE_TIMEOUT_MS = 8_000L
+        /** 单曲 URI 解析超时 */
+        private const val RESOLVE_TIMEOUT_MS = 5_000L
+        /** 搜索超时（阶段 3）：跨公网 + 内网两源，比单次浏览给得宽一些 */
+        private const val SEARCH_TIMEOUT_MS = 10_000L
+        /** 搜索结果缓存有效期（阶段 3）：覆盖 onSearch → onGetSearchResult 的两次调用间隔 */
+        private const val SEARCH_CACHE_TTL_MS = 60_000L
+        /** 睡眠定时器预设档位（分钟） */
+        private val SLEEP_TIMER_PRESETS = intArrayOf(15, 30, 60, 90)
+        /** 睡眠定时周期切换请求码 */
+        private const val RC_SLEEP_TIMER = 9001
+        private const val RC_PLAY_MODE = 9002
+    }}

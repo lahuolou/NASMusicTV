@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!--
+      Android 13+ 分区存储：只读音频文件。
+      ⛔ 由设置 → 本地音乐的总开关按需申请（MainActivity 的 localMusicPermissionLauncher），
+      不在启动时申请（Google 官方要求 "Request these permissions when the app needs
+      storage access, instead of at startup."）。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!--
+      照片墙「图库」来源（仅手机，§9.3）：Android 13+ 只读图片。
+      ⛔ 必须**由「图库」开关触发**请求，不能照搬 onCreate 里那段无条件请求（§9.4）。
+      ⚠️ 手机端「外接存储」只走 SAF（§6.3 路线 B），**不需要**本权限。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!--
+      Android 14+「仅选择照片」（§9.6）：不声明**也能用**（系统照样给该选项），
+      但系统会把 App 置于兼容模式、由系统接管「重新选择」；
+      声明后我们才能自控设置页里的「重新选择照片」入口。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!--
+      运行时通知权限已删除（2026-10-06 权限瘦身）：
+      全仓唯一的通知是媒体通知（PlaybackService 的 MediaStyle 模板），平台对
+      MediaSession 通知强制豁免该权限（AOSP NotificationManagerService 按
+      isMediaNotification() 放行）⇒ 声明与开机申请均无价值。
+      ⚠️ 豁免绑定在「MediaStyle + setMediaSession」模板上 —— 改通知构造会连带
+      失去豁免（PlaybackService 通知构造处有注释）。
+      电池优化白名单权限已删除（C1 裁决）：不再主动把用户弹到系统电池优化
+      设置页；加白名单由用户自行去系统设置。
+    -->
+
+    <!--
+      包可见性声明（API 30+）。两处消费方：
+      - 设置 → 数据 的「从本地文件导入」（备份 / 歌单 / 分离模型）用 ACTION_OPEN_DOCUMENT
+      - 导出与网盘目录选择用 ACTION_OPEN_DOCUMENT_TREE（`ExportPermissionHelper.isTreePickAvailable`
+        的 resolveActivity 探测，未声明时在本机同样查不到）
+      ⚠️ `<intent>` 的匹配是**逐字段比对**的：目标 filter 声明了 `<data mimeType>` 时，
+      查询侧不写 `<data>` 就数不相等 ⇒ 查不到（v2.39.3 在小米 MIUI 上就是这样把
+      「从本地文件导入」整行误判成不可用而藏掉的）。categories 同理，必须把
+      DocumentsUI 真正声明的 DEFAULT / OPENABLE 一起镜像过来。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.OPENABLE" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT_TREE" />
+            <category android:name="android.intent.category.DEFAULT" />
+        </intent>
+    </queries>
+
+    <!-- Device features: both TV and phone supported -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.screen.portrait"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.screen.landscape"
+        android:required="false" />
+    <!-- USB host 特性（可选，TV 设备可能无 USB 口） -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!--
+        〔2026-09-17 更新〕此前这里挂着 tools:ignore="MissingIntentFilterForMediaSearch"
+        抑制 —— 因为 lint 要求「声明了车机媒体支持就必须注册 MEDIA_PLAY_FROM_SEARCH」，
+        而当时 `onSetMediaItems` 只按 mediaId 查 BrowseCache，遇到空 mediaId 会原样返回，
+        声明了只会得到「搜了但没反应」的静默失效，所以有意暂缓。
+
+        现在 阶段 3 已落地，两个条件同时满足，抑制随之移除：
+          ① `PlaybackService.onSetMediaItems` 开头新增 searchQuery 分支（判定
+             `mediaId.isBlank() && requestMetadata.searchQuery.isNotBlank()`），
+             经 `resolveVoiceSearch()` 搜索并起播；
+          ② 服务 intent-filter 注册了 `android.media.action.MEDIA_PLAY_FROM_SEARCH`。
+        机制细节见 `PlaybackService.onSetMediaItems` 内的注释与
+        `docs/technical-overview.md` §10.157「七、搜索与语音（阶段 3）」。
+    -->
+    <application
+        android:name=".NasMusicApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NASMusicTV"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true"
+        android:banner="@drawable/banner"
+        android:largeHeap="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules">
+
+        <!-- Android Auto：声明本应用为媒体应用，使 Android Auto 能发现并加载。
+             缺少此项时 Android Auto 完全看不到本应用（即使 PlaybackService 已实现媒体树）。 -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!-- Android Auto / AAOS：提供方图标（attribution icon）。
+             用于「媒体内容优先」的位置（如媒体卡片），官方要求**必须单色**、推荐矢量。
+             未声明时车机侧只能退化成默认/启动器图标，与品牌不一致。
+             注意这里的 meta-data 名属于 androidx.car.app 命名空间，但**不需要引入
+             Car App Library 依赖** —— 它只是平台约定读取的一个字符串键，
+             与 AAOS 模板应用（navigation/POI）用的 androidx.car.app 是两回事。 -->
+        <meta-data
+            android:name="androidx.car.app.TintableAttributionIcon"
+            android:resource="@drawable/ic_car_attribution" />
+
+        <!-- Main Activity (supports both TV and phone) -->
+        <!-- v2.36.0 竖屏支持：
+             · screenOrientation 由 fullSensor 改为 unspecified —— fullSensor 会**忽略用户的系统旋转锁**，
+               与「自动」的预期不符；运行时方向一律由 MainActivity 的 requestedOrientation 决定
+               （见 resolveOrientation：auto→UNSPECIFIED / portrait→USER_PORTRAIT / landscape→USER_LANDSCAPE）。
+             · 声明 configChanges 以避免旋转重建 Activity（否则权限弹窗重弹、Compose 焦点/动画状态丢失）。
+               ⚠️ 刻意**不含** uiMode / density / layoutDirection —— 那会影响深色模式、字体缩放、RTL 的重建时机。 -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:icon="@drawable/banner"
+            android:logo="@drawable/banner"
+            android:screenOrientation="unspecified"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:theme="@style/Theme.NASMusicTV.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Playback Service -->
+        <service
+            android:name=".player.PlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <!-- Media3 客户端发现入口 -->
+                <action android:name="androidx.media3.session.MediaLibraryService" />
+                <!-- 平台 MediaBrowser 兼容层：Android Auto 通过此 action 经 PackageManager
+                     找到服务。两个 action 需同时注册（Media3 官方要求），缺前者 Media3 客户端
+                     找不到，缺后者平台 MediaBrowser / Android Auto 找不到。 -->
+                <action android:name="android.media.browse.MediaBrowserService" />
+                <!-- 车机语音搜索（阶段 3）：Google 助理「播放 XXX」发出的 action。
+                     声明后由 MediaSessionLegacyStub 转成 onSetMediaItems(mediaId="",
+                     searchQuery=XXX)，由 PlaybackService 的 searchQuery 分支处理。
+                     此前有意缺省并抑制 lint，原因见上方 application 前的注释。 -->
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>

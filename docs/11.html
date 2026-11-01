@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="color-scheme: light; background-color: #D5B88E;">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="color-scheme" content="light">
+    <title>千里江山 · 扫地老师</title>
+    <style>
+        :root { color-scheme: light; }
+        html, body {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #D5B88E !important; /* 参考图同款绢本底色 */
+            overflow: hidden;
+        }
+        
+        #container {
+            position: relative;
+            width: 100vw; height: 100vh;
+            background-color: #D5B88E;
+            overflow: hidden;
+        }
+
+        /* 视差层设置 */
+        .layer {
+            position: absolute;
+            top: 0; left: 0;
+            width: 200%; 
+            height: 100%;
+            will-change: transform;
+        }
+
+        /* 极缓慢滚动 */
+        .layer-far { animation: scroll 120s linear infinite; }
+        .layer-mid { animation: scroll 60s linear infinite; }
+        .layer-near { animation: scroll 35s linear infinite; }
+
+        @keyframes scroll {
+            0% { transform: translate3d(0, 0, 0); }
+            100% { transform: translate3d(-50%, 0, 0); } 
+        }
+
+        /* 音乐泛光层 */
+        .audio-glow {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(to top, rgba(180, 210, 200, 0.4) 0%, transparent 50%);
+            opacity: 0.2;
+            z-index: 4;
+            pointer-events: none;
+            mix-blend-mode: color-dodge;
+        }
+
+        /* 重度的全屏纹理（模拟古画的斑驳、颗粒与皴擦） */
+        .texture-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        /* ================= 右上角篆字印章 ================= */
+        .seal-container {
+            position: absolute;
+            top: 3vh; right: 3vw;
+            width: 76px; height: 76px;
+            z-index: 10;
+            /* 模拟真实印章盖在纸上的轻微倾斜和做旧感 */
+            transform: rotate(2deg);
+            opacity: 0.85;
+        }
+
+        .seal-bg {
+            width: 100%; height: 100%;
+            background-color: #B33028; /* 朱砂红 */
+            border-radius: 3px;
+            display: flex; flex-wrap: wrap;
+            justify-content: center; align-content: center;
+            padding: 6px; box-sizing: border-box;
+            /* 模拟印泥残缺的毛边 */
+            clip-path: polygon(2% 0, 98% 3%, 100% 95%, 95% 100%, 4% 98%, 0 5%);
+            box-shadow: inset 0 0 8px rgba(0,0,0,0.3);
+        }
+
+        .seal-char {
+            width: 50%; height: 50%;
+            display: flex; justify-content: center; align-items: center;
+            color: #F4E8D3;
+            font-family: "STKaiti", "KaiTi", "楷体", serif;
+            font-size: 22px; font-weight: bold;
+            text-shadow: 1px 1px 0 rgba(0,0,0,0.3);
+        }
+
+        .hint {
+            position: absolute;
+            bottom: 20px; left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255,255,255,0.8);
+            background: rgba(0,0,0,0.4);
+            padding: 6px 20px; border-radius: 20px;
+            font-size: 13px; z-index: 10;
+            pointer-events: none;
+            animation: fade 6s forwards;
+        }
+        @keyframes fade { 0%{opacity:1} 80%{opacity:1} 100%{opacity:0} }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    
+    <!-- ================= 1. 远景：淡色连绵群山 ================= -->
+    <svg class="layer layer-far" viewBox="0 0 2000 800" preserveAspectRatio="none">
+        <defs>
+            <linearGradient id="farGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#88A398" stop-opacity="0.5"/>
+                <stop offset="100%" stop-color="#D5B88E" stop-opacity="0"/>
+            </linearGradient>
+            <!-- 描点：连绵起伏 -->
+            <path id="farShape" d="M0,600 C100,580 150,500 250,520 C350,540 400,480 500,490 C600,500 650,450 750,470 C850,490 900,520 1000,510 C1100,500 1200,460 1300,480 C1400,500 1500,550 1600,520 C1700,490 1800,530 1900,500 C1950,480 1980,520 2000,530 L2000,800 L0,800 Z" fill="url(#farGrad)"/>
+        </defs>
+        <use href="#farShape" x="0" />
+        <use href="#farShape" x="2000" />
+    </svg>
+
+    <!-- ================= 2. 中景：主峰（核心视觉） ================= -->
+    <svg class="layer layer-mid" viewBox="0 0 2000 800" preserveAspectRatio="none">
+        <defs>
+            <!-- 石青渐变（山顶深，往下偏暗） -->
+            <linearGradient id="qingBlue" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#397A92"/>
+                <stop offset="40%" stop-color="#295E73"/>
+                <stop offset="100%" stop-color="#1D3F4B"/>
+            </linearGradient>
+            <!-- 石绿渐变 -->
+            <linearGradient id="qingGreen" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#6C9C73"/>
+                <stop offset="60%" stop-color="#456B4D"/>
+                <stop offset="100%" stop-color="#2A4633"/>
+            </linearGradient>
+            <!-- 赭石色（山脚泥土） -->
+            <linearGradient id="ochreGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#9A6846"/>
+                <stop offset="100%" stop-color="#553724"/>
+            </linearGradient>
+
+            <!-- 水墨皴擦滤镜，让边缘充满毛笔触感 -->
+            <filter id="inkTexture" x="-10%" y="-10%" width="120%" height="120%">
+                <feTurbulence type="fractalNoise" baseFrequency="0.05" numOctaves="4" result="noise" />
+                <feDisplacementMap in="SourceGraphic" in2="noise" scale="8" xChannelSelector="R" yChannelSelector="G" />
+            </filter>
+
+            <!-- 主峰组：多层叠加 -->
+            <g id="midPeaks">
+                <!-- 左侧主峰（石绿底色 + 石青点缀 + 金边） -->
+                <!-- 因为手写坐标很难完全复刻，这里用密集的点和多次贝塞尔来塑造山体褶皱 -->
+                <path d="M100,800 L150,680 L180,600 L220,550 L260,520 L300,450 L340,480 L370,420 L410,460 L450,510 L490,550 L530,620 L580,800 Z" fill="url(#qingGreen)" filter="url(#inkTexture)"/>
+                <!-- 山体高光/石青面 -->
+                <path d="M260,520 L300,450 L340,480 L370,420 L410,460 L380,500 L340,530 L300,580 Z" fill="url(#qingBlue)" opacity="0.85" filter="url(#inkTexture)"/>
+                <!-- 山脚赭石 -->
+                <path d="M100,800 L150,680 L180,600 L220,550 L260,580 L300,650 L350,720 L400,800 Z" fill="url(#ochreGrad)" opacity="0.6" filter="url(#inkTexture)"/>
+                <!-- 轮廓金边 -->
+                <path class="gold-edge" d="M150,680 L180,600 L220,550 L260,520 L300,450 L340,480 L370,420 L410,460 L450,510 L490,550 L530,620" fill="none" stroke="#C9A96A" stroke-width="2.5" opacity="0.3" />
+
+
+                <!-- 右侧连绵山丘 -->
+                <path d="M700,800 L800,650 L880,580 L950,550 L1020,600 L1100,650 L1180,720 L1250,800 Z" fill="url(#qingGreen)" filter="url(#inkTexture)"/>
+                <path d="M880,580 L950,550 L1020,600 L980,630 L920,650 Z" fill="url(#qingBlue)" opacity="0.85" filter="url(#inkTexture)"/>
+                <!-- 右侧山脚赭石 -->
+                <path d="M700,800 L800,650 L850,680 L900,750 L950,800 Z" fill="url(#ochreGrad)" opacity="0.6" filter="url(#inkTexture)"/>
+                
+                <!-- 中间的小丘陵 -->
+                <path d="M1200,800 L1300,720 L1380,680 L1450,700 L1550,780 L1600,800 Z" fill="url(#qingGreen)" opacity="0.8" filter="url(#inkTexture)"/>
+                <path d="M1380,680 L1450,700 L1500,740 L1420,760 Z" fill="url(#qingBlue)" opacity="0.7" filter="url(#inkTexture)"/>
+                
+                <!-- 山脚点苔（细小的墨点/小树） -->
+                <g fill="#1C2B26" filter="url(#inkTexture)" opacity="0.8">
+                    <!-- 用极小的路径模拟树丛 -->
+                    <path d="M240,580 L245,560 L250,580 L255,550 L260,580 L265,570 L270,590 Z" />
+                    <path d="M450,530 L455,510 L460,530 L465,500 L470,540 L475,520 L480,550 Z" />
+                    <path d="M800,660 L805,640 L810,660 L815,620 L820,670 L825,650 L830,680 Z" />
+                    <path d="M900,590 L905,570 L910,590 L915,550 L920,600 L925,580 L930,610 Z" />
+                </g>
+            </g>
+        </defs>
+        
+        <use href="#midPeaks" x="0" y="0" />
+        <use href="#midPeaks" x="2000" y="0" />
+    </svg>
+
+    <!-- ================= 3. 近景：江水与近岸 ================= -->
+    <svg class="layer layer-near" viewBox="0 0 2000 800" preserveAspectRatio="none">
+        <defs>
+            <!-- 江面颜色 -->
+            <linearGradient id="waterGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#3E7A78"/>
+                <stop offset="100%" stop-color="#1D3A3A"/>
+            </linearGradient>
+            
+            <g id="nearBase">
+                <!-- 水面底色 -->
+                <rect x="0" y="720" width="2000" height="80" fill="url(#waterGrad)" />
+                
+                <!-- 水波纹线条 -->
+                <path class="water-wave" d="M0,740 Q100,735 200,745 T400,740 T600,750 T800,740 T1000,745 T1200,735 T1400,745 T1600,740 T1800,750 T2000,740" fill="none" stroke="#6CA0A0" stroke-width="1.5" opacity="0.4" />
+                <path class="water-wave" d="M0,760 Q150,765 300,755 T600,765 T900,750 T1200,760 T1500,755 T1800,765 T2000,755" fill="none" stroke="#6CA0A0" stroke-width="1" opacity="0.3" />
+                
+                <!-- 近处深色岸边（岩石） -->
+                <path d="M0,800 L0,730 Q150,740 300,770 T600,790 T900,760 T1200,780 T1500,750 T1800,780 L2000,760 L2000,800 Z" fill="#152622" />
+            </g>
+        </defs>
+        <use href="#nearBase" x="0" y="0" />
+        <use href="#nearBase" x="2000" y="0" />
+    </svg>
+
+    <!-- 全屏纹理层：叠加古画特有的噪点和墨迹感 -->
+    <svg class="texture-layer">
+        <filter id="paperNoise">
+            <!-- 极高的基础频率产生极细的颗粒 -->
+            <feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="3" stitchTiles="stitch" />
+            <!-- 调整对比度，只保留微弱的颗粒，并将其颜色压暗 -->
+            <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.15 0" />
+        </filter>
+        <rect width="100%" height="100%" filter="url(#paperNoise)" style="mix-blend-mode: multiply;" />
+    </svg>
+
+    <!-- 音乐响应光效 -->
+    <div class="audio-glow" id="glowLayer"></div>
+
+    <!-- 印章 -->
+    <div class="seal-container">
+        <div class="seal-bg">
+            <div class="seal-char">扫</div><div class="seal-char">地</div>
+            <div class="seal-char">老</div><div class="seal-char">师</div>
+        </div>
+    </div>
+
+    <div class="hint">按住屏幕 体验音乐光效响应</div>
+</div>
+
+<script>
+    const glowLayer = document.getElementById('glowLayer');
+    const goldEdges = document.querySelectorAll('.gold-edge');
+    const waterWaves = document.querySelectorAll('.water-wave');
+    
+    let time = 0;
+    let energy = 0.1;
+    let targetEnergy = 0.1;
+
+    // 交互
+    const container = document.getElementById('container');
+    container.addEventListener('pointerdown', () => { targetEnergy = 1.0; });
+    container.addEventListener('pointerup', () => { targetEnergy = 0.1; });
+    container.addEventListener('pointerleave', () => { targetEnergy = 0.1; });
+
+    function animate() {
+        time += 0.04;
+        // 模拟自然声波起伏
+        let baseAudio = Math.sin(time * 2) * 0.1 + 0.15;
+        let currentTarget = targetEnergy > 0.5 ? 1.0 : baseAudio;
+        
+        // 平滑插值
+        energy += (currentTarget - energy) * 0.1;
+
+        // 1. 江水随着音乐泛起淡淡的光晕
+        glowLayer.style.opacity = energy * 0.8;
+
+        // 2. 山脊金边亮起
+        goldEdges.forEach(edge => {
+            edge.style.opacity = 0.2 + energy * 0.7;
+            edge.style.stroke = energy > 0.5 ? '#F4E8D3' : '#C9A96A'; 
+        });
+
+        // 3. 水波闪烁
+        waterWaves.forEach(wave => {
+            wave.style.opacity = 0.3 + energy * 0.6;
+        });
+
+        requestAnimationFrame(animate);
+    }
+
+    animate();
+</script>
+</body>
+</html>

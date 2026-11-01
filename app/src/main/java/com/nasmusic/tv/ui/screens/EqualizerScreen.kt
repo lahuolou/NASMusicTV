@@ -1,0 +1,235 @@
+package com.nasmusic.tv.ui.screens
+
+import com.nasmusic.tv.ui.theme.FontSize
+
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.tv.material3.ClickableSurfaceDefaults
+import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.Surface
+import androidx.tv.material3.Text
+import com.nasmusic.tv.R
+import com.nasmusic.tv.data.model.EqualizerPreset
+import com.nasmusic.tv.ui.theme.Accent
+import com.nasmusic.tv.ui.theme.LocalUiMode
+import com.nasmusic.tv.ui.theme.NasMusicColors
+import com.nasmusic.tv.ui.theme.UiMode
+import com.nasmusic.tv.ui.components.BackButton
+import com.nasmusic.tv.data.model.VisualizerTheme
+import com.nasmusic.tv.ui.components.FocusableSurface
+import com.nasmusic.tv.ui.components.LocalFocusableContentColor
+import com.nasmusic.tv.ui.components.VisualEqualizer
+import kotlinx.coroutines.launch
+
+/**
+ * 均衡器屏幕
+ * 预设选择 + 各频段增益调节（数字显示）
+ */
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun EqualizerScreen(
+    presets: List<EqualizerPreset>,
+    currentPreset: EqualizerPreset,
+    currentBands: List<Float>,
+    onSelectPreset: (EqualizerPreset) -> Unit,
+    onAdjustBand: (Int, Float) -> Unit,
+    onBack: () -> Unit,
+    visualizerTheme: VisualizerTheme = VisualizerTheme.Default,
+    modifier: Modifier = Modifier
+) {
+    // v2.36.0 竖屏：页 padding 32→16
+    val isPhonePortrait = LocalUiMode.current == UiMode.PhonePortrait
+    val isPhoneLandscape = LocalUiMode.current == UiMode.PhoneLandscape
+    Column(
+        modifier = modifier.fillMaxSize().padding(
+            horizontal = if (isPhoneLandscape) 16.dp else if (isPhonePortrait) 16.dp else 32.dp,
+            vertical = if (isPhoneLandscape) 0.dp else if (isPhonePortrait) 12.dp else 20.dp
+        )
+    ) {
+        // 返回 + 标题
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            BackButton(onClick = onBack)
+            Spacer(modifier = Modifier.width(16.dp))
+            Text(
+                text = stringResource(R.string.equalizer_title),
+                color = NasMusicColors.TextPrimary,
+                fontSize = FontSize.title()
+            )
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            // 频谱可视化预览
+            item {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = stringResource(R.string.home_spectrum_preview),
+                        color = NasMusicColors.TextSecondary,
+                        fontSize = FontSize.body(),
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
+                    VisualEqualizer(
+                        isPlaying = true,
+                        theme = visualizerTheme,
+                        barCount = 24,
+                        modifier = Modifier.fillMaxWidth().height(64.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
+            // 预设列表
+            item {
+                Text(
+                    text = stringResource(R.string.equalizer_preset),
+                    color = NasMusicColors.TextPrimary,
+                    fontSize = FontSize.button(),
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+            }
+items(presets, key = { it.name }) { preset ->
+                val isSelected = currentPreset?.name == preset.name
+                FocusableSurface(
+                    onClick = { onSelectPreset(preset) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(
+                            width = if (isSelected) 1.dp else 0.dp,
+                            color = if (isSelected) NasMusicColors.Primary else Color.Transparent,
+                            shape = RoundedCornerShape(8.dp)
+                        ),
+                    shape = RoundedCornerShape(8.dp),
+                    focusedScale = 1.02f,
+                    animationDurationMs = 200,
+                    containerColor = if (isSelected) NasMusicColors.Primary.copy(alpha = 0.2f)
+                                    else NasMusicColors.Surface.copy(alpha = 0.5f),
+                    focusedContainerColor = if (isSelected) NasMusicColors.Primary.copy(alpha = 0.3f)
+                                            else NasMusicColors.Primary.copy(alpha = 0.15f),
+                    contentColor = NasMusicColors.TextPrimary,
+                    focusedContentColor = NasMusicColors.Primary,
+                    pressedContainerColor = NasMusicColors.SurfaceVariant,
+                    pressedContentColor = NasMusicColors.TextPrimary,
+                    pressedScale = 0.96f,
+                    focusBorderColor = NasMusicColors.FocusRing,
+                    showFocusBorder = true,
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (isSelected) "✓  " else "   ",
+                            color = NasMusicColors.Primary,
+                            fontSize = FontSize.button()
+                        )
+                        Text(
+                            text = stringResource(preset.displayNameRes),
+                            color = LocalFocusableContentColor.current,
+                            fontSize = FontSize.button(),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+
+            // 频段调节（仅在自定义预设时显示）
+            if (currentBands.size >= 5) {
+                item {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = stringResource(R.string.equalizer_bands),
+                        color = NasMusicColors.TextPrimary,
+                        fontSize = FontSize.button(),
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                }
+                // bandLabels 在 LazyListScope 中不可使用 remember，提前在 Composable 作用域中定义
+                val bandLabels = listOf("31Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz")
+                items(bandLabels.size) { index ->
+                    val band = currentBands.getOrElse(index) { 0f }
+
+                    FocusableSurface(
+                        onClick = {
+                            // 循环递增：-10 → -9 → ... → 9 → 10 → -10 → ...
+                            val newValue = if (band >= 10f) -10f else band + 1f
+                            onAdjustBand(index, newValue)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(6.dp),
+                        focusedScale = 1.02f,
+                        animationDurationMs = 200,
+                        containerColor = NasMusicColors.Surface.copy(alpha = 0.5f),
+                        focusedContainerColor = NasMusicColors.Primary.copy(alpha = 0.2f),
+                        contentColor = NasMusicColors.TextPrimary,
+                        pressedScale = 0.98f
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = bandLabels[index],
+                                color = NasMusicColors.TextPrimary,
+                                fontSize = FontSize.body(),
+                                modifier = Modifier.width(60.dp)
+                            )
+                            Spacer(modifier = Modifier.weight(1f))
+                            val dbText = if (band > 0) "+${"%.1f".format(band)} dB"
+                                         else "${"%.1f".format(band)} dB"
+                            Text(
+                                text = dbText,
+                                color = if (band > 0) NasMusicColors.Primary
+                                        else if (band < 0) Accent
+                                        else NasMusicColors.TextSecondary,
+                                fontSize = FontSize.button()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

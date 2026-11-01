@@ -1,0 +1,645 @@
+package com.nasmusic.tv
+
+import android.app.Application
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
+import com.nasmusic.tv.backend.BackendRegistry
+import com.nasmusic.tv.backend.SearchAggregator
+import com.nasmusic.tv.backend.local.LocalMusicRepository
+import com.nasmusic.tv.backend.local.MusicScanner
+import com.nasmusic.tv.backend.local.StorageMonitor
+import com.nasmusic.tv.backend.local.db.LocalMusicDatabase
+import com.nasmusic.tv.backend.network.HttpPlayabilityProbe
+import com.nasmusic.tv.backend.network.JamendoService
+import com.nasmusic.tv.backend.network.MetingApiService
+import com.nasmusic.tv.backend.network.NetworkMusicManager
+import com.nasmusic.tv.backend.network.NetworkSongId
+import com.nasmusic.tv.backend.radio.RadioBrowserClient
+import com.nasmusic.tv.backend.local.AlbumCoverResolver
+import com.nasmusic.tv.backend.local.ArtistCoverResolver
+import com.nasmusic.tv.backend.local.CoverUrlPersistentCache
+import com.nasmusic.tv.backend.local.ItunesCoverSearcher
+import com.nasmusic.tv.backend.network.baidu.BaiduCoverProvider
+import com.nasmusic.tv.backend.network.baidu.BaiduFileIndexCache
+import com.nasmusic.tv.backend.network.baidu.BaiduHttpDataSourceFactory
+import com.nasmusic.tv.backend.network.baidu.BaiduLyricsProvider
+import com.nasmusic.tv.backend.network.baidu.BaiduMvFileService
+import com.nasmusic.tv.backend.network.baidu.BaiduNetdiskService
+import com.nasmusic.tv.backend.network.baidu.BaiduOAuthClient
+import com.nasmusic.tv.backend.network.baidu.BaiduPanApi
+import com.nasmusic.tv.backend.network.baidu.BaiduStreamFactory
+import com.nasmusic.tv.backend.playlist.PlaylistEnricher
+import com.nasmusic.tv.backend.network.mv.BilibiliMvService
+import com.nasmusic.tv.backend.network.mv.MvSearchManager
+import com.nasmusic.tv.backend.network.mv.MvPersistentCache
+import com.nasmusic.tv.backend.network.netease.NeteaseOpenApi
+import com.nasmusic.tv.data.model.CloudDriveType
+import com.nasmusic.tv.data.prefs.AppPreferences
+import com.nasmusic.tv.player.ModelDownloadManager
+import com.nasmusic.tv.player.PlayerManager
+import com.nasmusic.tv.util.AppLog
+import com.nasmusic.tv.util.LogStore
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import okhttp3.OkHttpClient
+import java.io.File
+
+/**
+ * Application 类 — 手动 DI 容器
+ * 持有所有全局单例实例
+ */
+class NasMusicApp : Application(), ImageLoaderFactory {
+
+    companion object {
+        /**
+         * 崩溃处理器是否已安装（进程级一次性）。
+         *
+         * ⚠️ 必须在 companion 里而不是实例字段：Robolectric 每个测试方法都会新建
+         * Application，实例字段会让处理器一层层套娃（每个都包住上一个），
+         * 2000+ 用例跑下来栈会越堆越深。
+         */
+        @Volatile
+        private var crashLoggerInstalled = false
+
+        /**
+         * 读取系统当前 locale（不受 Application.updateConfiguration 影响）。
+         *
+         * Locale.getDefault() 在进程存活期间可被 Resources.updateConfiguration() 污染，
+         * 不能作为"跟随系统"的判断依据。Resources.getSystem() 是系统级 Resources，
+         * 其 configuration 总是反映真正的系统 locale。
+         */
+        fun getSystemLocale(): java.util.Locale {
+            val sysConfig = android.content.res.Resources.getSystem().configuration
+            return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                sysConfig.locales[0]
+            } else {
+                @Suppress("DEPRECATION")
+                sysConfig.locale ?: java.util.Locale.getDefault()
+            }
+        }
+    }
+
+    lateinit var backendRegistry: BackendRegistry
+        private set
+    lateinit var appPreferences: AppPreferences
+        private set
+    lateinit var playerManager: PlayerManager
+        private set
+    lateinit var networkMusicManager: NetworkMusicManager
+        private set
+    /**
+     * v2.35.0 多码率：单曲音质覆盖（两级模型的"单曲"层）。
+     * 独立 DataStore 文件，500 条 LRU 上限（方案 §2.3.1）。
+     */
+    lateinit var qualityOverrides: com.nasmusic.tv.data.prefs.QualityOverrides
+        private set
+    lateinit var playlistEnricher: PlaylistEnricher
+        private set
+
+    // ---- F2-2 / L3：播放模式切换事件（通知栏按钮 / 系统媒体卡片 → UI 侧）----
+    //
+    // 取代原先的 `var playModeToggleHandler: (() -> Unit)?` 可变闭包字段。原实现的问题
+    // **不在 GC**：闭包捕获的是 ViewModel 而非 Activity，不会形成 Activity 泄漏；问题在于
+    // **订阅生命周期无法自动收敛**——onDestroy 里的清空被 `if (!isFinishing) return` 前置
+    // 拦截，配置重建与「不保留活动」等场景下，Application 会长期持有上一个 Activity 的
+    // ViewModel 闭包。改为 SharedFlow 后由订阅方的 CoroutineScope 决定生命周期，作用域
+    // 取消即退订，无需手动解绑。
+    //
+    // ⚠️ 刻意**不设缓冲**（replay = 0、无 extraBufferCapacity）：事件只在存在活跃订阅者时
+    // 投递，否则丢弃。若允许缓冲，用户在无 UI 时（后台播放 / Activity 已销毁）点通知按钮，
+    // 事件会滞留到下次打开 App 才被消费，表现为「一进应用播放模式自己跳了一档」。丢弃与
+    // 旧实现 `handler == null` 时静默无反应完全同义，不退化。
+    // extraBufferCapacity = 1：0 缓冲时有订阅者时 tryEmit 必失败（投递需挂起），
+    // 通知栏切换永远无效（CI 实测 + 独立 JVM 实验证实）。加 1 格缓冲后 tryEmit
+    // 在有订阅者时必成功；replay 仍为 0，事件不会滞留给迟到的订阅者。
+    private val _playModeToggleEvents = MutableSharedFlow<Unit>(replay = 0, extraBufferCapacity = 1)
+    val playModeToggleEvents: SharedFlow<Unit> = _playModeToggleEvents.asSharedFlow()
+
+    // ---- P1-2 修复（2026-09-16）：下载/自动下载的用户提示通道 ----
+    //
+    // 原 onNotify 回调只做了 AppLog.d（注释声称「由 MainViewModel 在 init 时注册」但从未注册），
+    // 下载失败 / 存储不足 / 配额已满等提示用户完全看不到。
+    // 现通过此 SharedFlow 广播，MainViewModel 收集后转发到 errorMessage（有 UI 消费方）。
+    // replay = 1：下载失败常发生在 Activity 未就绪时（启动早期崩溃恢复触发），晚订阅也能收到。
+    private val _downloadNotifyMessage = MutableSharedFlow<String>(replay = 1, extraBufferCapacity = 8)
+    val downloadNotifyMessage: SharedFlow<String> = _downloadNotifyMessage.asSharedFlow()
+    /** 活跃订阅者数（供测试与诊断；SubscriptionCount 是 SharedFlow 的内建保证） */
+    val playModeToggleSubscriberCount = _playModeToggleEvents.subscriptionCount
+
+    /**
+     * 请求切换播放模式（通知栏 / 媒体卡片按钮 → UI 侧执行）。
+     *
+     * 真正的切换动作必须由 UI 侧完成：playMode 的真相在 `PlayerViewModel`（B-13：UI/设置
+     * 状态，不归 PlayerManager），服务侧独立完成会与界面显示脱节。
+     *
+     * @return true 已投递给至少一个订阅者；false 当前无 UI 订阅（事件按设计丢弃）
+     *
+     * ⚠️ 不能直接用 tryEmit 返回值判断「有无订阅者」：无订阅者时 emit 立即完成
+     * （值被丢弃）tryEmit 也返回 true。必须先查 subscriptionCount。
+     */
+    fun requestPlayModeToggle(): Boolean {
+        if (_playModeToggleEvents.subscriptionCount.value == 0) return false
+        return _playModeToggleEvents.tryEmit(Unit)
+    }
+
+    /** 智能电台 Manager（F2-3）：基于当前歌曲流派+歌手生成相似随机流 */
+    lateinit var smartRadioManager: com.nasmusic.tv.backend.radio.SmartRadioManager
+        private set
+    lateinit var mvSearchManager: MvSearchManager
+        private set
+
+    /** 跨源搜索聚合器（含本地音乐源） */
+    lateinit var searchAggregator: SearchAggregator
+        private set
+
+    /** 本地音乐仓库（索引持久化 + 增量扫描 + 索引搜索） */
+    lateinit var localMusicRepository: LocalMusicRepository
+        private set
+
+    /** 存储设备监听器（USB / SD 卡插拔） */
+    lateinit var storageMonitor: StorageMonitor
+        private set
+
+    /** 高质量人声分离模型下载管理器（HT-Demucs FT ONNX） */
+    lateinit var modelDownloadManager: ModelDownloadManager
+        private set
+
+    // ---- 离线下载组件（需求 6/7/8/9/10）----
+    /** 下载索引仓库（downloads.db） */
+    lateinit var downloadRepository: com.nasmusic.tv.backend.download.DownloadRepository
+        private set
+    /** 存储空间守护 */
+    lateinit var storageGuard: com.nasmusic.tv.backend.download.StorageGuard
+        private set
+    /** 下载编排器（串行队列 / 状态机 / 进度 / 重试） */
+    lateinit var songDownloadManager: com.nasmusic.tv.backend.download.SongDownloadManager
+        private set
+    /** 播放时自动下载控制器 */
+    lateinit var autoDownloadController: com.nasmusic.tv.backend.download.AutoDownloadController
+        private set
+    /**
+     * v2.35.0 多码率：下载直链解析器（含 detailed lambda，带降级信号）。
+     * 供 DownloadViewModel 的可用码率探测复用，保证探测与下载走同一实现。
+     */
+    lateinit var downloadResolver: com.nasmusic.tv.backend.download.StreamUrlResolver
+        private set
+    /** 导出到外接设备协调器 */
+    lateinit var exportCoordinator: com.nasmusic.tv.backend.export.ExportCoordinator
+        private set
+
+    /** 懒构造 LyricsManager（供下载器歌词注入；与 MainViewModel 共用同一后端/网络上下文） */
+    private val downloadLyricsManager: com.nasmusic.tv.lyrics.LyricsManager by lazy {
+        com.nasmusic.tv.lyrics.LyricsManager(
+            this,
+            backendRegistry,
+            networkMusicManager,
+            // F-3：改 provider（读 @Volatile 镜像）——设置页改歌词源即时生效，且构造期零 IO
+            kugouBaseUrlProvider = { appPreferences.lyrics.getLyricsKugouBaseUrlSync() },
+            neteaseBaseUrlProvider = { appPreferences.lyrics.getLyricsNeteaseBaseUrlSync() }
+        )
+    }
+
+    /**
+     * 人脸检测结果库（`photo_face.db`，阶段 11）。
+     *
+     * ⚠️ `by lazy`：**不要在 onCreate 里初始化** —— 绝大多数用户不用「仅显示含人像」，
+     * 没必要让每个启动都建第三个 Room 实例。首次「开始人脸检测」才真正打开。
+     */
+    val photoFaceDatabase: com.nasmusic.tv.backend.photo.db.PhotoFaceDatabase by lazy {
+        com.nasmusic.tv.backend.photo.db.PhotoFaceDatabase.get(this)
+    }
+
+    // ---- 百度网盘组件（懒构造，仅在用户开启百度源时实例化）----
+    /** 百度专用 OkHttpClient（守护线程池 + 系统默认 TLS 校验；独立实例避免与全局播放 client 争抢连接池） */
+    val baiduOkHttpClient: OkHttpClient by lazy { BaiduOAuthClient.buildClient() }
+val baiduOAuthClient: BaiduOAuthClient by lazy { BaiduOAuthClient(this, baiduOkHttpClient, appPreferences) }
+    val baiduPanApi: BaiduPanApi by lazy { BaiduPanApi(this, baiduOkHttpClient, baiduOAuthClient) }
+    val baiduStreamFactory: BaiduStreamFactory by lazy { BaiduStreamFactory(baiduPanApi, baiduOAuthClient) }
+    val baiduFileIndexCache: BaiduFileIndexCache by lazy { BaiduFileIndexCache(this) }
+    val baiduLyricsProvider: BaiduLyricsProvider by lazy { BaiduLyricsProvider(baiduPanApi, baiduOkHttpClient, baiduOAuthClient) }
+    val baiduCoverProvider: BaiduCoverProvider by lazy {
+        BaiduCoverProvider(baiduPanApi, baiduOkHttpClient, baiduOAuthClient)
+    }
+    val albumCoverResolver: AlbumCoverResolver by lazy {
+        AlbumCoverResolver(baiduCoverProvider, baiduOkHttpClient, { title, artist ->
+            networkMusicManager.searchCoverUrl(title, artist)
+        }, baiduFileIndexCache)
+    }
+    val artistCoverResolver: ArtistCoverResolver by lazy { ArtistCoverResolver(baiduOkHttpClient) }
+    /** 专辑/艺术家封面 URL 持久缓存（JSON 文件，跨会话复用，避免重复网络搜索） */
+    val coverUrlPersistentCache: CoverUrlPersistentCache by lazy { CoverUrlPersistentCache(this) }
+    val itunesCoverSearcher: ItunesCoverSearcher by lazy { ItunesCoverSearcher(baiduOkHttpClient) }
+    val baiduNetdiskService: BaiduNetdiskService by lazy {
+        BaiduNetdiskService(
+            oauth = baiduOAuthClient,
+            api = baiduPanApi,
+            streamFactory = baiduStreamFactory,
+            lyricsProvider = baiduLyricsProvider,
+            coverProvider = baiduCoverProvider,
+            indexCache = baiduFileIndexCache,
+            prefs = appPreferences,
+            networkCoverSearch = { title, artist -> networkMusicManager.searchCoverUrl(title, artist) },
+            itunesCoverSearch = { title, artist -> itunesCoverSearcher.searchTrack(title, artist) }
+        )
+    }
+    val baiduMvFileService: BaiduMvFileService by lazy {
+        BaiduMvFileService(
+            api = baiduPanApi,
+            streamFactory = baiduStreamFactory,
+            indexCache = baiduFileIndexCache,
+            prefs = appPreferences
+        )
+    }
+
+    // ---- 电台 & Jamendo（纯公共 API，不自建后台）----
+    /** radio-browser 电台客户端 */
+    val radioBrowserClient: RadioBrowserClient by lazy {
+        RadioBrowserClient()
+    }
+    /** Jamendo（CC 独立音乐）服务：clientId 由设置页配置，未配置时 registerService 跳过 */
+    val jamendoService: JamendoService by lazy {
+        JamendoService(
+            clientIdProvider = { appPreferences.network.getJamendoClientIdSync() }
+        )
+    }
+
+    /**
+     * 应用级协程作用域，用于 onDestroy 等生命周期之后的异步操作
+     * 使用 SupervisorJob 确保子协程失败不会取消其他子协程
+     *
+     * ⛔ **必须带 [CoroutineExceptionHandler]**：`SupervisorJob` 的子协程被当作 root coroutine，
+     * 失败时走 `handleCoroutineException`；context 里没有 handler 就会落到
+     * `Thread.defaultUncaughtExceptionHandler` —— 真机上表现为崩溃或被静默吞掉（既不崩溃也不留痕），
+     * 而本作用域里跑的正是崩溃恢复、存储轮询这类**不该让应用出事**的后台工作。
+     *
+     * ⚠️ 这不只是健壮性。**它同时是 `PhotoWallControllerTest > empty pool never starts a swap
+     * and never crashes` 那条既有红的根因修复**（2026-10-12 定位）：
+     * 单测用 `@Config(application = NasMusicApp::class)` 让 Robolectric 真跑 onCreate，
+     * 其中 `:500` 的 `recoverAfterCrash()`（**唯一没包 try/catch 的一处**，`:517` 包了）会在
+     * `Dispatchers.IO` 上发起 Room 查询；Robolectric 每个测试方法换一个 SQLite 连接池，
+     * 该查询落到已拆掉的连接上抛 `IllegalStateException: Illegal connection pointer`。
+     * 经本作用域 → 全局收集器 → 被**下一个**进入 `runTest` 的类接盘 ⇒
+     * `UncaughtExceptionsBeforeTest` 落在 `PhotoWallControllerTest.kt:166`（全树 runTest 最密集，最容易接盘）。
+     *
+     * 有了 handler，`handleCoroutineException` 命中它后**不再**回落到 platform handlers，
+     * 异常因而不会变成 unhandled —— 测试那条红随之消失，而根因（后台恢复失败）仍被 AppLog 留痕。
+     */
+    /**
+     * 安装未捕获异常记录器（进程级一次性，委托原处理器）。
+     *
+     * 电视上没有 adb，闪退后唯一的现场就是这条记录 —— 所以走
+     * [LogStore.appendBlocking]（同步写）而不是异步队列：进程马上就要终止，
+     * 入队的任务等不到执行。写完后**必须**把异常交还给原处理器，
+     * 保持系统默认的崩溃行为（⛔ 不要在这里吞掉异常）。
+     */
+    private fun installCrashLogger() {
+        if (crashLoggerInstalled) return
+        crashLoggerInstalled = true
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            runCatching {
+                LogStore.appendBlocking(
+                    LogStore.LEVEL_ERROR,
+                    "CRASH",
+                    "未捕获异常（线程 ${thread.name}）",
+                    throwable,
+                )
+            }
+            previous?.uncaughtException(thread, throwable)
+        }
+    }
+
+    val applicationScope: CoroutineScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, t ->
+            AppLog.e("NasMusicApp", "applicationScope 未捕获异常（后台任务失败，不应影响应用）", t)
+        }
+    )
+
+    override fun onCreate() {
+        super.onCreate()
+        // v2.39.4：运行日志落盘（设置页「日志」tab）+ 崩溃留痕。
+        // ⚠️ 必须在其他初始化之前：越早装好，越能接住启动期的闪退。
+        LogStore.init(filesDir)
+        installCrashLogger()
+        appPreferences = AppPreferences.getInstance(this)
+        // v2.35.0 多码率：单曲覆盖存储（须在 networkMusicManager 构造前初始化，供 provider 闭包使用）
+        qualityOverrides = com.nasmusic.tv.data.prefs.QualityOverrides(this)
+        // R-7（第三类）：启动 provider 键内存镜像收集（DataStore Flow → @Volatile）
+        appPreferences.startProviderMirrors(applicationScope)
+        // R-7（第一类）：语言镜像一次性迁移（老版本 DataStore 已有语言值，镜像为空时补写）
+        appPreferences.migrateLanguageMirrorIfNeeded()
+        // 启动时应用语言设置（读 SharedPreferences 镜像，零 IO）
+        applyLocale(appPreferences.getLanguageSync())
+        // 传入 applicationContext（Application 级，不泄漏）：供需要持久化设备标识的
+        // 后端适配器使用（如飞牛音乐的 deviceId）。
+        backendRegistry = BackendRegistry(applicationContext)
+        playerManager = PlayerManager(this)
+        // F2-3：智能电台（打分纯函数在 RadioSongScorer，播放次数作偏好信号）
+        smartRadioManager = com.nasmusic.tv.backend.radio.SmartRadioManager(
+            backendRegistry = backendRegistry,
+            scope = applicationScope,
+            playCountsProvider = { appPreferences.history.playCounts.firstOrNull() ?: emptyMap() },
+            // F2-3 多源化：Meting 歌单采样（networkMusicManager 227 行才初始化，用延迟 lambda）
+            networkPlaylistProvider = { pid -> networkMusicManager.getPlaylist(pid) },
+            networkPlaylistIds = listOf(
+                "3778678", "3779629", "19723756", "3136952023",
+                "60198", "377165088", "2211745987", "2884035"
+            ),
+            // F2-3 多源化：本地歌曲（localMusicRepository 254 行才初始化，延迟 lambda）
+            localSongsProvider = { localMusicRepository.loadFromCache() }
+        )
+        // 模型下载管理器（HT-Demucs FT ONNX，与 APK 分离，设置页下载）
+        modelDownloadManager = ModelDownloadManager(this) { appPreferences.getModelDownloadUrlSync() }
+        playerManager.setModelDownloadManager(modelDownloadManager)
+        // 网络音乐管理器：注册所有网络源，默认源与 Meting 端点均由 AppSettings 动态提供
+        val services = mapOf(
+            NetworkSongId.METING_SOURCE to MetingApiService(
+                baseUrlProvider = { appPreferences.network.getMetingApiBaseUrlSync() },
+                serverProvider = { appPreferences.network.getMusicSourceSync() },
+                // F2-6：音质档位（AUTO=0 不传 br；显式档位走降级链）
+                qualityTierProvider = { appPreferences.getQualityTierSync() },
+                // 艺人全量方案 Q2：网易免鉴权优先。基址复用歌词那个设置项（不新增设置项）
+                netease = NeteaseOpenApi(
+                    baseUrlProvider = { appPreferences.lyrics.getLyricsNeteaseBaseUrlSync() }
+                ),
+                // 艺人全量方案 §3.8 第 1 步（Q4）：判据做实——跟一跳拿最终 Content-Type
+                probe = HttpPlayabilityProbe()
+            )
+        )
+        networkMusicManager = NetworkMusicManager(
+            services = services,
+            defaultSourceProvider = { appPreferences.network.getDefaultNetworkSourceSync() },
+            // v2.35.0 多码率：全局默认档位 + 单曲覆盖（两级模型，方案 §2.3）
+            qualityTierProvider = { appPreferences.getQualityTierSync() },
+            songQualityOverrideProvider = { src, id -> qualityOverrides.tierOf(src, id) }
+        )
+        // v2.35.0 多码率（修 G5）：档位变化 → 清空播放直链缓存，避免切档后仍命中旧档直链
+        appPreferences.setOnQualityTierChanged { networkMusicManager.clearPlayUrlCache() }
+        // 终审 B3：换平台 / 换 Meting 端点同样要清——缓存 key 不认识这两维，旧 DEAD 会套到另一首歌上
+        appPreferences.setOnPlayUrlCacheInvalidated { networkMusicManager.clearPlayUrlCache() }
+        // 百度网盘：仅在总开关开启且已登录时注册（运行时切换开关时动态注册/注销）
+        // T2 第一批（2026-09-14）：onCreate 需同步拿配置，用 runBlocking{first()}（不带 IO 调度器，
+        // 不占 Default/IO 线程池；阻塞主线程仅限启动初始化阶段，可接受）
+        if (runBlocking { appPreferences.baidu.baiduConfigFlow.first() }.isActive) {
+            networkMusicManager.registerService(baiduNetdiskService)
+        }
+        // Jamendo：仅当已配置 client_id 时注册（未配置时 Jamendo Tab 显示引导）
+        if (appPreferences.network.getJamendoClientIdSync().isNotBlank()) {
+            networkMusicManager.registerService(jamendoService)
+        }
+
+        // 歌单导入补全器：依赖 backendRegistry + networkMusicManager + appPreferences
+        // 放在各后端注册完成后，供 PlayerViewModel / MainViewModel 播放时同步补全 stub
+        playlistEnricher = PlaylistEnricher(
+            backendRegistry = backendRegistry,
+            networkMusicManager = networkMusicManager,
+            prefs = appPreferences,
+        )
+
+        // MV（音乐视频）搜索管理器：Bilibili 在线 + 百度本地 MV（百度优先）
+        val mvServices = listOf(
+            baiduMvFileService,    // 本地 MV 优先（仅对百度歌曲生效，非百度歌曲返回 null）
+            BilibiliMvService(
+                baseUrlProvider = { appPreferences.network.getMvApiBaseUrlSync() }
+            )
+        )
+        mvSearchManager = MvSearchManager(
+            services = mvServices,
+            persistentCache = MvPersistentCache(this)
+        )
+
+        // 本地音乐组件：索引仓库 + USB 插拔监听
+        val localMusicDao = LocalMusicDatabase.get(this).localMusicDao()
+        localMusicRepository = LocalMusicRepository(this, localMusicDao, MusicScanner(this))
+        storageMonitor = StorageMonitor(this)
+        storageMonitor.startListening()
+
+        // 离线下载组件（需求 6/7/8/9/10）
+        downloadRepository = com.nasmusic.tv.backend.download.DownloadRepository(this)
+        val downloadDao = downloadRepository.getDao()
+        // 让本地曲库合并下载目录（扫描短路 MMR）与删除判定分支用
+        localMusicRepository.attachDownloadSource(
+            downloadDao,
+            downloadRootProvider = { getExternalFilesDir(android.os.Environment.DIRECTORY_MUSIC) }
+        )
+        storageGuard = com.nasmusic.tv.backend.download.StorageGuard(
+            this,
+            // cache-inventory-exempt: 外部音乐目录的回落路径，已计入 CacheInventory 的 dir="" 条目
+            rootProvider = { getExternalFilesDir(android.os.Environment.DIRECTORY_MUSIC) ?: File(filesDir, "music") }
+        )
+        val downloadResolver = com.nasmusic.tv.backend.download.StreamUrlResolver(
+            adapter = { backendRegistry.getAdapter() },
+            network = { song -> networkMusicManager.resolvePlayUrl(song) },
+            baidu = { song -> networkMusicManager.resolvePlayUrl(song) },
+            // v2.35.0 多码率：带降级信号的解析（下载链路据此决定文件名后缀与落库档位）
+            networkDetailed = { song, q -> networkMusicManager.resolvePlayUrlDetailed(song, q) }
+        )
+        this.downloadResolver = downloadResolver
+        val pathBuilder = com.nasmusic.tv.backend.download.DownloadPathBuilder {
+            // cache-inventory-exempt: 外部音乐目录的回落路径，已计入 CacheInventory 的 dir="" 条目
+            getExternalFilesDir(android.os.Environment.DIRECTORY_MUSIC) ?: File(filesDir, "music")
+        }
+        val coverWriter = com.nasmusic.tv.backend.download.CoverFileWriter(
+            baiduOkHttpClient,
+            networkMusicManager,
+            itunesCoverSearcher,
+            artistCoverResolver
+        )
+        songDownloadManager = com.nasmusic.tv.backend.download.SongDownloadManager(
+            context = this,
+            scope = applicationScope,
+            repo = downloadRepository,
+            storage = storageGuard,
+            paths = pathBuilder,
+            resolver = downloadResolver,
+            tagWriter = com.nasmusic.tv.backend.download.MediaTagWriter,
+            coverWriter = coverWriter,
+            lyricsProvider = { song ->
+                val lyr = downloadLyricsManager.getLyrics(song)
+                if (lyr != null) com.nasmusic.tv.lyrics.LrcParser.toLrcText(lyr) else null
+            },
+            settings = {
+                // P3：单次快照，避免 4 次 first() 读到不一致的设置状态
+                val snap = appPreferences.appSettings.first()
+                com.nasmusic.tv.backend.download.model.DownloadSettings(
+                    downloadEnabled = snap.downloadEnabled,
+                    autoDownloadOnPlay = snap.autoDownloadOnPlay,
+                    autoDownloadLimit = snap.autoDownloadLimit,
+                    downloadLocation = snap.downloadLocation
+                )
+            },
+            onNotify = { msg ->
+                // P1-2 修复（2026-09-16）：接入 downloadNotifyMessage → MainViewModel.showError → UI。
+                // 原实现只有 AppLog.d（宣称的 MainViewModel 注册从未发生），提示不可见。
+                com.nasmusic.tv.util.AppLog.d("NasMusicApp", "download notify: $msg")
+                _downloadNotifyMessage.tryEmit(msg)
+            },
+            onCompleted = { entity ->
+                // §7.5.5 即时入库：把下载完成的实体构建为 ScannedSong 插入 local_songs，
+                // 之后刷新 _localSongs（由 MainViewModel 监听 observeCompleted 自行处理，
+                // 这里只负责落库，保证 storageType="DOWNLOAD" 且 MusicSourceType.DOWNLOAD 徽章可命中）
+                runCatching {
+                    val mediaStoreId = com.nasmusic.tv.util.HashUtils.stablePathHash64(entity.audioPath ?: entity.songKey)
+                    val scanned = com.nasmusic.tv.backend.local.ScannedSong(
+                        mediaStoreId = mediaStoreId,
+                        title = entity.title,
+                        artist = entity.artist,
+                        album = entity.album,
+                        // P2-3 修复（2026-09-16）：原为 albumId = mediaStoreId（路径哈希），
+                        // 会让 toSong 生成 content://media/.../albumart/<哈希> 这种必 404 的封面 URI；
+                        // 置 0 → coverUrl 返回 null → 走本地内嵌封面提取链路（下载时已内嵌）。
+                        albumId = 0L,
+                        duration = entity.durationMs,
+                        size = entity.fileSize,
+                        dateAdded = entity.completedAt ?: System.currentTimeMillis(),
+                        mimeType = when (entity.containerExt.lowercase()) {
+                            "mp3" -> "audio/mpeg"
+                            "flac" -> "audio/flac"
+                            "m4a" -> "audio/mp4"
+                            "aac" -> "audio/aac"
+                            "ogg" -> "audio/ogg"
+                            "opus" -> "audio/opus"
+                            "wav" -> "audio/wav"
+                            else -> "audio/*"
+                        },
+                        contentUri = android.net.Uri.fromFile(java.io.File(entity.audioPath ?: return@runCatching)),
+                        volumeName = "local_download",
+                        storageType = com.nasmusic.tv.data.model.StorageType.DOWNLOAD
+                    )
+                    localMusicRepository.upsertDownloaded(scanned)
+                }.onFailure {
+                    com.nasmusic.tv.util.AppLog.w("NasMusicApp", "onCompleted upsert failed: ${it.message}", it)
+                }
+            }
+        )
+autoDownloadController = com.nasmusic.tv.backend.download.AutoDownloadController(
+            context = this,
+            settings = {
+                // P3：单次快照，避免 4 次 first() 读到不一致的设置状态
+                val snap = appPreferences.appSettings.first()
+                com.nasmusic.tv.backend.download.model.DownloadSettings(
+                    downloadEnabled = snap.downloadEnabled,
+                    autoDownloadOnPlay = snap.autoDownloadOnPlay,
+                    autoDownloadLimit = snap.autoDownloadLimit,
+                    downloadLocation = snap.downloadLocation
+                )
+            },
+            repo = downloadRepository,
+            storage = storageGuard,
+            resolver = downloadResolver,
+            manager = songDownloadManager,
+            notify = { msg ->
+                // P1-2 修复：同 SongDownloadManager.onNotify，转发到 downloadNotifyMessage
+                com.nasmusic.tv.util.AppLog.d("NasMusicApp", "auto-dl: $msg")
+                _downloadNotifyMessage.tryEmit(msg)
+            },
+            scope = applicationScope,
+            // v2.35.0 多码率：自动下载统一用全局默认档位，不消费单曲覆盖（方案 §2.3.2）
+            qualityTierProvider = { appPreferences.getQualityTierSync() }
+        )
+        exportCoordinator = com.nasmusic.tv.backend.export.ExportCoordinator(
+            context = this,
+            appPreferences = appPreferences,
+            downloadRepository = downloadRepository,
+            downloadPathBuilder = pathBuilder,
+            // F-4：注入应用级 scope，删除组件私有 scope（单例场景语义不变）
+            externalScope = applicationScope
+        )
+
+        // 存储守护启动 + 崩溃恢复 + MediaTagWriter 全局配置
+        com.nasmusic.tv.backend.download.MediaTagWriter.configure()
+        storageGuard.start(applicationScope)
+        applicationScope.launch { songDownloadManager.recoverAfterCrash() }
+
+        // 跨源搜索聚合器（注入本地音乐源，检测 TV 设备以启用拼音搜索）
+        val isTVDevice = packageManager.hasSystemFeature("android.software.leanback") ||
+                packageManager.hasSystemFeature("android.hardware.type.television")
+        searchAggregator = SearchAggregator(
+            backendRegistry = backendRegistry,
+            networkMusicManager = networkMusicManager,
+            baiduService = baiduNetdiskService,
+            jamendoService = jamendoService,
+            localMusicRepository = localMusicRepository,
+            isTVDevice = isTVDevice,
+            // M7（§5.2）：suspend provider，与同文件 appSettings.first() 既有写法一致
+            localMusicEnabled = { appPreferences.appSettings.first().localMusicEnabled }
+        )
+
+        // 启动时清理超过 30 天的搜索历史
+        applicationScope.launch {
+            try {
+                appPreferences.purgeExpiredSearchHistory()
+            } catch (e: Exception) {
+                AppLog.w("NasMusicApp", "Failed to purge search history", e)
+            }
+        }
+    }
+
+    /**
+     * 应用语言设置（手动 Configuration 更新，无需 AppCompat）
+     * @param lang "system"=跟随系统, "zh"=中文, "en"=English
+     */
+    fun applyLocale(lang: String) {
+        val locale = when (lang) {
+            "zh" -> java.util.Locale.SIMPLIFIED_CHINESE
+            "en" -> java.util.Locale.US
+            else -> getSystemLocale() // 跟随系统：读取真正的系统 locale，而非被污染的 Locale.getDefault()
+        }
+        val config = android.content.res.Configuration(resources.configuration)
+        config.setLocale(locale)
+        @Suppress("DEPRECATION")
+        resources.updateConfiguration(config, resources.displayMetrics)
+    }
+
+    /**
+     * 百度网盘开关切换：运行时注册/注销百度 NetworkMusicService。
+     * - 开启且已登录：注册
+     * - 关闭或登出：注销
+     * T2 第一批（2026-09-14）：getBaiduConfigSync()（runBlocking+IO）→ baiduConfigFlow.first()，
+     * 消除主线程/线程池阻塞；调用方需处于协程上下文。
+     */
+    suspend fun refreshBaiduServiceRegistration() {
+        val cfg = appPreferences.baidu.baiduConfigFlow.first()
+        if (cfg.isActive) {
+            networkMusicManager.registerService(baiduNetdiskService)
+        } else {
+            networkMusicManager.unregisterService("baidu")
+        }
+    }
+
+    /**
+     * Coil ImageLoader：注入百度 dlink UA 拦截器，使百度网盘封面图片可加载（否则 403）。
+     */
+    override fun newImageLoader(): ImageLoader {
+        return ImageLoader.Builder(this)
+            .okHttpClient(BaiduHttpDataSourceFactory.createOkHttpClientForCoil())
+            .memoryCache {
+                MemoryCache.Builder(this).maxSizePercent(0.25).build()
+            }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(cacheDir.resolve("image_cache"))
+                    .maxSizeBytes(100L * 1024 * 1024)
+                    .build()
+            }
+            .crossfade(true)
+            .build()
+    }
+
+    override fun onTerminate() {
+        super.onTerminate()
+        applicationScope.cancel()
+    }
+}

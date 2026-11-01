@@ -1,0 +1,174 @@
+package com.nasmusic.tv.player
+
+import android.content.Context
+import com.nasmusic.tv.util.AppLog
+import java.io.File
+
+/**
+ * 伴奏文件缓存管理
+ *
+ * 功能：
+ * 1. 缓存人声分离结果（伴奏/人声/原唱 WAV 文件），避免重复分离
+ * 2. LRU 淘汰：总缓存上限 500MB / 最多 10 个文件
+ *
+ * 缓存策略：
+ * - 文件路径：context.cacheDir/accompaniment/{songId}_accompaniment.wav
+ * - 文件名：{songId}_accompaniment.wav
+ * - LRU 淘汰：按最后访问时间排序，超过 500MB 时删除最旧的文件
+ */
+class AccompanimentCache(
+    private val context: Context
+) {
+
+    companion object {
+        private const val TAG = "AccompanimentCache"
+        private const val CACHE_DIR_NAME = "accompaniment"
+        private const val MAX_CACHE_SIZE_BYTES = 500L * 1024 * 1024 // 500MB
+        private const val MAX_CACHE_FILES = 10  // 最多保留10首伴奏
+    }
+
+    private val cacheDir: File by lazy {
+        File(context.cacheDir, CACHE_DIR_NAME).also { it.mkdirs() }
+    }
+
+    /**
+     * 检查伴奏文件是否已缓存
+     */
+    fun hasAccompaniment(songId: String): Boolean {
+        val file = getAccompanimentFile(songId)
+        val exists = file.exists() && file.length() > 0
+        if (exists) {
+            // 更新访问时间（LRU）
+            file.setLastModified(System.currentTimeMillis())
+        }
+        return exists
+    }
+
+    /**
+     * 获取伴奏文件
+     */
+    fun getAccompanimentFile(songId: String): File {
+        return File(cacheDir, "${songId}_accompaniment.wav")
+    }
+
+    /**
+     * 获取人声文件（用于高质量模式播放）
+     */
+    fun getVocalsFile(songId: String): File {
+        return File(cacheDir, "${songId}_vocals.wav")
+    }
+
+    /**
+     * 清理缓存（LRU 淘汰：按大小 + 文件数）
+     */
+    private fun cleanupCache() {
+        val files = cacheDir.listFiles() ?: return
+
+        // 1. 按文件数淘汰（最多保留 MAX_CACHE_FILES 首）
+        if (files.size > MAX_CACHE_FILES) {
+            val sortedFiles = files.sortedBy { it.lastModified() }
+            val toDelete = files.size - MAX_CACHE_FILES
+            for (i in 0 until toDelete) {
+                val file = sortedFiles[i]
+                val fileSize = file.length()
+                if (file.delete()) {
+                    AppLog.d(TAG, "cleanupCache: deleted (count limit) ${file.name} (${fileSize} bytes)")
+                }
+            }
+        }
+
+        // 2. 按总大小淘汰（LRU）
+        val remainingFiles = cacheDir.listFiles() ?: return
+        val totalSize = remainingFiles.sumOf { it.length() }
+        if (totalSize <= MAX_CACHE_SIZE_BYTES) return
+
+        val sortedFiles = remainingFiles.sortedBy { it.lastModified() }
+        var freedSize = 0L
+        val targetFree = totalSize - MAX_CACHE_SIZE_BYTES
+
+        for (file in sortedFiles) {
+            if (freedSize >= targetFree) break
+            val fileSize = file.length()
+            if (file.delete()) {
+                freedSize += fileSize
+                AppLog.d(TAG, "cleanupCache: deleted (size limit) ${file.name} (${fileSize} bytes)")
+            }
+        }
+    }
+
+    /**
+     * 获取缓存大小（字节）
+     */
+    fun getCacheSize(): Long {
+        return cacheDir.listFiles()?.sumOf { it.length() } ?: 0L
+    }
+
+    /**
+     * M5 修复（2026-10-06，代码审查报告 §4）：公开 LRU 淘汰入口。
+     *
+     * 旧缺陷：[cleanupCache] 唯一触发点在 [saveOriginalFile] 且受 `!dest.exists()`
+     * 保护——本地歌曲（无输入文件、不走 saveOriginalFile）与网络歌曲二次分离
+     * 都不触发，但分离出的伴奏/人声 WAV（单曲 30-60MB）就写在同一缓存目录，
+     * 缓存无上限增长（KDoc 承诺 500MB/10 文件双上限失效）。
+     * 修复：分离结果落盘完成后由调用方（HqSeparationOrchestrator）显式调用本方法。
+     */
+    fun cleanup() = cleanupCache()
+
+    /**
+     * 获取缓存文件数
+     */
+    fun getCacheFileCount(): Int {
+        return cacheDir.listFiles()?.size ?: 0
+    }
+
+    /**
+     * 清空缓存
+     *
+     * @return 释放的字节数（T8b 起有真调用方：设置页「清除分离缓存」，返回字节数供 formatBytes 提示）
+     */
+    fun clearCache(): Long {
+        var freed = 0L
+        cacheDir.listFiles()?.forEach { f ->
+            val len = runCatching { f.length() }.getOrDefault(0L)
+            if (runCatching { f.delete() }.getOrDefault(false)) freed += len
+        }
+        AppLog.d(TAG, "clearCache: all files deleted")
+        return freed
+    }
+
+    /**
+     * 获取原唱缓存文件
+     */
+    fun getOriginalFile(songId: String): File {
+        return File(cacheDir, "${songId}_original.wav")
+    }
+
+    /**
+     * 保存原唱文件（分离时下载的输入文件重命名保存）
+     */
+    fun saveOriginalFile(songId: String, sourcePath: String) {
+        val source = File(sourcePath)
+        if (source.exists() && source.length() > 0) {
+            val dest = getOriginalFile(songId)
+            if (!dest.exists()) {
+                source.copyTo(dest, overwrite = true)
+                AppLog.d(TAG, "saveOriginalFile: saved ${dest.name} (${dest.length()} bytes)")
+                // P14 修复：原唱文件也占用缓存目录，保存后立即触发 LRU 淘汰。
+                // 原实现 cleanupCache 仅在预分离路径触发，HQ 主路径分离 + saveOriginalFile
+                // 永不淘汰，缓存无限增长写满 TV 内置存储。
+                cleanupCache()
+            }
+        }
+    }
+
+    /**
+     * 删除指定歌曲的缓存
+     */
+    fun deleteCache(songId: String) {
+        val accompanimentFile = getAccompanimentFile(songId)
+        val vocalsFile = getVocalsFile(songId)
+        accompanimentFile.delete()
+        vocalsFile.delete()
+        AppLog.d(TAG, "deleteCache: deleted files for $songId")
+    }
+}

@@ -1,0 +1,173 @@
+package com.nasmusic.tv.backend.network.mv
+
+import android.content.Context
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import com.nasmusic.tv.data.model.MvCacheEntry
+import com.nasmusic.tv.util.AppLog
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * MV 持久缓存（跨会话复用 bvid，避免重复搜索）
+ *
+ * 存储 songId -> MvCacheEntry 映射，只存 bvid（稳定不变）不存直链（过期）。
+ * 播放时 [MvSearchManager] 先查此缓存拿到 bvid，再 [MvSearchService.resolveMv] 获取新鲜直链。
+ *
+ * - MV 播完时调 [markCompleted] 写入/更新条目（playCount++，说明用户认可这个版本）
+ * - 用户切换 MV 后播完 -> 覆盖旧 bvid（更新为用户最终认可的版本）
+ * - LRU 淘汰：超过 [MAX_ENTRIES] 条时删 lastPlayedAt 最旧的
+ *
+ * 文件格式：JSON Map<songId, MvCacheEntry>，存 app filesDir/mv_cache.json
+ */
+class MvPersistentCache(context: Context) {
+
+    private val cache = ConcurrentHashMap<String, MvCacheEntry>()
+    private val gson = Gson()
+    private val file by lazy { File(context.filesDir, "mv_cache.json") }
+
+    companion object {
+        private const val TAG = "MvPersistentCache"
+        private const val MAX_ENTRIES = 5000
+    }
+
+    /**
+     * L5 修复（2026-10-06，代码审查报告 §5）：load 从构造期 init 块改为首次访问惰性加载。
+     * 本类在 NasMusicApp.onCreate（主线程）构造，旧实现同步读盘 + Gson 解析 5000 条
+     * JSON 会拖慢冷启动（潜在主线程卡顿）；首次真正 get/put 时才读盘。
+     * 线程安全：volatile 双检 + 加载后不可变标志，与旧语义一致（只有主线程与
+     * mvVM 协程访问，双检足够；写操作本身已在调用方串行化）。
+     */
+    @Volatile
+    private var loaded = false
+
+    private fun ensureLoaded() {
+        if (loaded) return
+        synchronized(this) {
+            if (!loaded) {
+                load()
+                loaded = true
+            }
+        }
+    }
+
+    fun get(songId: String): MvCacheEntry? {
+        ensureLoaded()
+        return cache[songId]
+    }
+
+    fun put(entry: MvCacheEntry) {
+        ensureLoaded()
+        cache[entry.songId] = entry
+        if (cache.size > MAX_ENTRIES) evictOldest()
+        save()
+    }
+
+    /**
+     * 标记某首歌的某支 MV 播放完成（用户认可这个版本）。
+     * 已有条目则 playCount++ + 更新 bvid/lastPlayedAt；无则新建。
+     */
+    fun markCompleted(songId: String, songTitle: String, songArtist: String, bvid: String, mvTitle: String) {
+        ensureLoaded()
+        val existing = cache[songId]
+        val entry = MvCacheEntry(
+            songId = songId,
+            songTitle = songTitle,
+            songArtist = songArtist,
+            bvid = bvid,
+            mvTitle = mvTitle,
+            lastPlayedAt = System.currentTimeMillis(),
+            playCount = (existing?.playCount ?: 0) + 1
+        )
+        cache[songId] = entry
+        if (cache.size > MAX_ENTRIES) evictOldest()
+        save()
+        AppLog.d(TAG, "markCompleted: '$songTitle' -> bvid=$bvid playCount=${entry.playCount}")
+    }
+
+    fun remove(songId: String) {
+        ensureLoaded()
+        cache.remove(songId)
+        save()
+    }
+
+    /**
+     * 清空全部 MV 持久缓存（内存 + 磁盘文件）。
+     * 供设置页"缓存管理"手动清除使用。
+     *
+     * 2026-09-26 审查补修（MvPersistentCache saveLock Low）：清 map 与删文件整体纳入
+     * saveLock —— 否则并发 save() 在 clear 之前捕获的旧 map 会在 rename 后"复活"被清条目
+     *（save 先 toMap 快照、clear 后删文件、save 再 rename 落盘旧数据）。
+     */
+    fun clear() {
+        ensureLoaded()
+        synchronized(saveLock) {
+            cache.clear()
+            try {
+                if (file.exists()) file.delete()
+            } catch (e: Exception) {
+                AppLog.e(TAG, "clear failed: ${e.message}", e)
+            }
+        }
+        AppLog.d(TAG, "cleared")
+    }
+
+    /** 导出全部条目（供备份用） */
+    fun exportAll(): List<MvCacheEntry> {
+        ensureLoaded()
+        return cache.values.toList()
+    }
+
+    /** 导入条目（恢复备份用，覆盖现有数据） */
+    fun importAll(entries: List<MvCacheEntry>) {
+        ensureLoaded()
+        cache.clear()
+        entries.forEach { cache[it.songId] = it }
+        if (cache.size > MAX_ENTRIES) evictOldest()
+        save()
+        AppLog.d(TAG, "importAll: ${cache.size} entries")
+    }
+
+    private fun evictOldest() {
+        val sorted = cache.entries.sortedBy { it.value.lastPlayedAt }
+        val toRemove = sorted.take(cache.size - MAX_ENTRIES)
+        toRemove.forEach { cache.remove(it.key) }
+        AppLog.d(TAG, "evicted ${toRemove.size} entries, remaining=${cache.size}")
+    }
+
+    private fun load() {
+        try {
+            if (!file.exists()) return
+            val json = file.readText()
+            if (json.isBlank()) return
+            val type = object : TypeToken<Map<String, MvCacheEntry>>() {}.type
+            val loaded = gson.fromJson<Map<String, MvCacheEntry>>(json, type) ?: return
+            cache.putAll(loaded)
+            AppLog.d(TAG, "loaded ${cache.size} entries")
+        } catch (e: Exception) {
+            AppLog.e(TAG, "load failed: ${e.message}", e)
+        }
+    }
+
+    // 2026-09-25 审查修复（2-4）：put()（IO 线程）与 markCompleted()（主线程）可并发进入
+    // save()，两个线程同时写同一 .tmp 互相踩踏 → rename 后 JSON 损坏、下次 load 全量丢失。
+    // 写 tmp+rename 序列整体加锁（与 BaiduFileIndexCache 的 cacheLock 同语义）。
+    private val saveLock = Any()
+
+    private fun save() = synchronized(saveLock) {
+        try {
+            val json = gson.toJson(cache.toMap())
+            // 修复（2026-09-22 审查）：writeText 直写非原子——写盘中途被杀会损坏
+            // mv_cache.json 导致全量缓存丢失。改 tmp+rename 原子写（与
+            // CoverUrlPersistentCache 的 H-5 语义一致；个别 ROM rename 失败回退直写）。
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(json)
+            if (!tmp.renameTo(file)) {
+                file.writeText(json)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            AppLog.e(TAG, "save failed: ${e.message}", e)
+        }
+    }
+}

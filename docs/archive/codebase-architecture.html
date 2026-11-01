@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NASMusicTV 代码架构图</title>
+<style>
+:root{
+  --bg:#0d1117;--card:#161b22;--card2:#1c2129;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;--link:#58a6ff;
+  --ui:#d29922;--vm:#f778ba;--domain:#a371f7;--backend:#3fb950;--data:#58a6ff;--infra:#768390;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;line-height:1.6;padding:24px 16px 64px}
+.wrap{max-width:1280px;margin:0 auto}
+header{text-align:center;padding:36px 0 12px}
+header h1{font-size:30px;font-weight:700;background:linear-gradient(90deg,#58a6ff,#f778ba,#d29922);-webkit-background-clip:text;background-clip:text;color:transparent}
+header p{color:var(--muted);margin-top:6px;font-size:14px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:26px 0}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 10px;text-align:center}
+.stat b{display:block;font-size:24px;font-family:Consolas,monospace}
+.stat span{font-size:12px;color:var(--muted)}
+h2{font-size:20px;margin:36px 0 14px;padding-left:12px;border-left:4px solid var(--link)}
+h3{font-size:15px;margin:0 0 10px;color:var(--text)}
+.layer{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:0}
+.layer-ui{border-left:4px solid var(--ui)}.layer-vm{border-left:4px solid var(--vm)}
+.layer-domain{border-left:4px solid var(--domain)}.layer-backend{border-left:4px solid var(--backend)}
+.layer-data{border-left:4px solid var(--data)}.layer-infra{border-left:4px solid var(--infra)}
+.flow-arrow{text-align:center;color:var(--muted);font-size:20px;padding:2px 0;user-select:none}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.mod{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
+.mod h4{font-size:14px;margin-bottom:4px}
+.mod h4 code{color:var(--link);font-size:13px}
+.meta{font-size:12px;color:var(--muted);font-family:Consolas,monospace}
+.mod ul{list-style:none;margin-top:8px}
+.mod li{font-size:12.5px;padding:2px 0 2px 14px;position:relative;color:#c9d1d9}
+.mod li::before{content:"·";position:absolute;left:2px;color:var(--muted)}
+.badge{display:inline-block;font-size:11px;padding:1px 8px;border-radius:10px;margin-left:6px;font-family:Consolas,monospace;vertical-align:1px}
+.b-r{background:#1f3a5f;color:#79c0ff}.b-f{background:#2a4b2a;color:#7ee787}
+.b-n{background:#4a2b52;color:#d2a8ff}.b-ok{background:#1f4a2e;color:#56d364}
+.b-no{background:#4a3030;color:#f85149}.b-part{background:#4a3f1f;color:#e3b341}
+.tag{display:inline-block;font-size:11px;font-family:Consolas,monospace;border-radius:4px;padding:1px 6px;margin:2px 2px}
+.di{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}
+.di ol{list-style:none;column-count:2;column-gap:24px}
+.di li{font-size:13px;padding:3px 0;break-inside:avoid;font-family:Consolas,monospace}
+.di li em{color:var(--muted);font-style:normal;font-size:11px;display:block}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{border:1px solid var(--border);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--card2);font-size:12.5px}
+td code{color:var(--link);font-family:Consolas,monospace;font-size:12px}
+.stepflow{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.step{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12.5px}
+.step b{display:block;font-size:12px;color:var(--link)}
+.arr{color:var(--muted);font-size:16px}
+.note{font-size:12px;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)}
+footer{text-align:center;color:var(--muted);font-size:12px;margin-top:48px}
+@media(max-width:720px){.di ol{column-count:1}}
+
+/* ── 类级调用图谱 ── */
+#graphWrap{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+#gtoolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}
+#gtoolbar button{background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 14px;font-size:12.5px;cursor:pointer}
+#gtoolbar button:hover{border-color:var(--link)}
+.glegend{display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted)}
+.glegend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:3px;vertical-align:-1px}
+#gsvgBox{border:1px solid var(--border);border-radius:8px;background:#0a0e14;overflow:hidden}
+#gsvg{display:block;width:100%;height:820px;touch-action:none;user-select:none;cursor:grab}
+#gsvg:active{cursor:grabbing}
+.gnode rect{fill:var(--card2);stroke-width:1.4;cursor:move}
+.gnode text{fill:var(--text);font-size:11.5px;font-family:Consolas,monospace;pointer-events:none}
+.gnode.dim{opacity:.16}
+.gnode.hl rect{stroke-width:2.4;filter:drop-shadow(0 0 5px rgba(88,166,255,.55))}
+.gedge{fill:none;stroke:#58a6ff;stroke-opacity:.2}
+.gedge.hl{stroke-opacity:.95;stroke-width:2!important}
+.gedge.dim{stroke-opacity:.04}
+.gcluster{fill:rgba(139,148,158,.05);stroke:#8b949e;stroke-dasharray:5 4;stroke-opacity:.55;stroke-width:1.2}
+.gclabel{fill:#8b949e;font-size:10.5px;font-family:Consolas,monospace}
+.ghint{font-size:12px;color:var(--muted);margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>NASMusicTV · 代码架构图</h1>
+<p>Android TV 音乐播放器（Kotlin + Jetpack Compose for TV）· v2.28.0 · GPL v3 · min SDK 22 / target SDK 34</p>
+</header>
+
+<div class="stats">
+<div class="stat"><b>252</b><span>Kotlin 文件</span></div>
+<div class="stat"><b>53,389</b><span>代码行数</span></div>
+<div class="stat"><b>8</b><span>顶层包</span></div>
+<div class="stat"><b>5</b><span>后端适配器</span></div>
+<div class="stat"><b>13</b><span>领域子 ViewModel</span></div>
+<div class="stat"><b>270</b><span>单元测试（全绿）</span></div>
+</div>
+
+<h2>一、分层总览</h2>
+<p style="color:var(--muted);font-size:13px;margin-bottom:10px">依赖方向自上而下：UI → ViewModel → 领域/后端 → 数据/基础设施。层间经手动 DI 容器（<code>NasMusicApp</code>）注入，无 DI 框架（R-8 定案）。</p>
+
+<div class="layer layer-ui">
+<h3>🖥️ UI 层 <span class="meta">ui/ · 85 文件 · 26,778 行</span></h3>
+<div class="grid g4">
+<div class="mod"><h4><code>ui/components</code> <span class="meta">28 文件 · 6,883 行</span></h4><ul>
+<li><b>AppRoot</b> · 1084 行 — 唯一组合根，when(currentScreen) 手动路由，顶层订阅 18 处 <span class="badge b-n">N-3</span></li>
+<li>KaraokePlaybackScreen · 803 / MvPlaybackScreen · 474 — 沉浸式全屏页</li>
+<li>UnifiedSongRow · 638 — 统一歌曲行（NAS/网络/本地/百度四源徽章）</li>
+<li>PlayerControls · 404 / VisualEqualizer · 401 / LyricsView · 247</li>
+<li>FocusableSurface / DialogBackHandler — TV D-Pad 焦点基建</li>
+</ul></div>
+<div class="mod"><h4><code>ui/screens</code> <span class="meta">39 文件 · 12,717 行</span></h4><ul>
+<li>SettingsScreen · 924（容器）+ settings/ 10 文件 · 2,054 行（9 个 Section，State/Actions 签名）<span class="badge b-r">R-2</span></li>
+<li>LibraryScreen · 647 + library/ 9 文件 · 2,286 行（browse/ 五 Tab）<span class="badge b-r">R-3</span></li>
+<li>HomeScreen 766 / MineScreen 766 / NowPlayingScreen 740 / ServerConnectScreen 733</li>
+<li>netdisk/ · 2 文件 — 百度网盘浏览</li>
+</ul></div>
+<div class="mod"><h4><code>ui/</code> 根与主题</h4><ul>
+<li><b>MainActivity</b>（com.nasmusic.tv.ui.MainActivity）— 唯一 Activity，Three-level BACK 手势</li>
+<li>theme/ · 2 文件 — TV Material 3 主题（ExperimentalTvMaterial3Api）</li>
+<li>导航：Screen 枚举 + 手动 when 分支（未用 Jetpack Navigation）</li>
+</ul></div>
+</div>
+</div>
+<div class="flow-arrow">▼ collectAsState（子 VM 直调）<span class="badge b-n">N-1</span> &nbsp; ▲ 事件回调 / Actions</div>
+<div class="layer layer-vm">
+<h3>🧠 ViewModel 层 <span class="meta">ui/viewmodel/ · 14 文件 · 6,348 行</span></h3>
+<div class="grid g2">
+<div class="mod"><h4><code>MainViewModel</code> <span class="meta">3055 行 · 协调者 + 跨域接线</span> <span class="badge b-r">R-1</span><span class="badge b-n">N-1</span></h4><ul>
+<li>持有并公开 12 个子 VM 实例（只读属性，手动 DI）<span class="badge b-ok">N-1 完成</span></li>
+<li>init 接线区：子 VM 跨域回调注入（onConnected/onPlayQueue/showMessage…）</li>
+<li>保留：曲库浏览/歌词/详情页自有逻辑、RemoteCallbacks 收口（手机遥控）、12 个胶水转发</li>
+<li>事件契约：<code>ViewModelEvents</code> · 48 行（sealed interface）</li>
+</ul></div>
+<div class="mod"><h4>12 个领域子 ViewModel</h4><ul>
+<li><b>NetworkMusicViewModel</b> · 707 — 网络音乐/百度网盘/收藏（BaiduConnectionState）</li>
+<li><b>MvSearchViewModel</b> · 373 — MV 搜索/连播模式（suppressPlayback 协作）</li>
+<li><b>PlayerViewModel</b> · 365 — 播放控制/进度/播放模式</li>
+<li><b>SearchViewModel</b> · 359 — 多源聚合搜索</li>
+<li><b>DownloadViewModel</b> · 271 / <b>VocalSeparationViewModel</b> · 266（K 歌）</li>
+<li>WeatherRadioViewModel · 250 / ServerViewModel · 236 / BackupViewModel · 147</li>
+<li>PlaylistViewModel · 126 / PlayHistoryViewModel · 119 / NavigationViewModel · 16</li>
+</ul></div>
+</div>
+</div>
+<div class="flow-arrow">▼ 子 VM 构造注入 / StateFlow 订阅 &nbsp; ▲ PlayerHost 窄接口回调 <span class="badge b-n">N-4</span></div>
+
+<div class="layer layer-domain">
+<h3>🎵 播放领域层 <span class="meta">player/ · 15 文件 · 4,292 行</span> <span class="badge b-n">N-4</span></h3>
+<div class="grid g3">
+<div class="mod"><h4><code>PlayerManager</code> <span class="meta">1020 行 · 播放核心+队列状态机</span></h4><ul>
+<li>ExoPlayer 生命周期 / 1000ms Handler 进度轮询 / seek 状态</li>
+<li>队列 CRUD / 播放模式 / 随机历史 / restoreQueue</li>
+<li>对外 API 门面：HQ/均衡器经委托转发（调用面零改动）</li>
+</ul></div>
+<div class="mod"><h4>拆出组件（N-4）</h4><ul>
+<li><b>HqSeparationOrchestrator</b> · 501 行 — HQ 人声分离编排（下载→模型→分离→切伴奏），经 <code>PlayerHost</code> 窄接口回调播放操作</li>
+<li><b>PlayerEqualizer</b> · 192 行 — 均衡器/频谱绑定重试</li>
+<li><b>VocalSeparationController</b> · 84 行 — 分离模式状态（R-5）</li>
+</ul></div>
+<div class="mod"><h4>播放基建</h4><ul>
+<li><b>PlaybackService</b> · 423 行 — Media3 MediaLibraryService；MediaSession/音频焦点延迟创建（首次播放时）</li>
+<li>DemucsSeparator · 551（ONNX）/ VocalRemovalProcessor · 304 / SpectralMaskProcessor · 161</li>
+<li>AccompanimentCache · 274 / ModelDownloadManager · 224 / SpectrumAnalyzer · 280</li>
+<li>MediaLibraryTree（蓝牙媒体树）/ CoilBitmapLoader / SeparationMode</li>
+</ul></div>
+</div>
+</div>
+<div class="flow-arrow">▼ BackendAdapter 接口（getSongs/getStreamUrl/搜索/封面…） &nbsp; 共享 OkHttp 池 <span class="badge b-r">R-6</span></div>
+<div class="layer layer-backend">
+<h3>🔌 后端接入层 <span class="meta">backend/ · 64 文件 · 14,263 行</span></h3>
+<div class="grid g3">
+<div class="mod"><h4><code>backend</code> 根 — 注册与聚合</h4><ul>
+<li><b>BackendAdapter</b> — 适配器接口（曲库浏览/搜索/封面/流 URL/歌词/收藏）</li>
+<li><b>BackendRegistry</b> — 活动适配器持有者；companion 持共享 ConnectionPool（5 连接/5min）+ Dispatcher（16 并发）<span class="badge b-r">R-6</span></li>
+<li><b>SearchAggregator</b> — 多源并行搜索聚合（各源 withTimeoutOrNull）</li>
+</ul></div>
+<div class="mod"><h4><code>backend/impl</code> <span class="meta">5 NAS 适配器 · 4,273 行</span></h4><ul>
+<li><b>JellyfinAdapter</b> · 1218 行 <span class="badge b-no">定案不拆</span></li>
+<li><b>NavidromeAdapter</b> · 902 行 — 全量委托 SubsonicRestClient <span class="badge b-r">R-10</span></li>
+<li><b>SubsonicAdapter</b> · 833 行 — 部分委托（URL 格式差异保留自有 buildRestUrl）</li>
+<li>FeiniuAdapter · 663 / DaoliyuAdapter · 559</li>
+<li><b>SubsonicRestClient</b> · 98 行 — 公共层（buildRestUrl/md5/executeRequest）<span class="badge b-r">R-10</span></li>
+</ul></div>
+<div class="mod"><h4><code>backend/network</code> 网络音乐 <span class="meta">21 文件 · 4,185 行</span></h4><ul>
+<li><b>NetworkMusicManager</b> — 多端点 Meting API（302 解析/端点回退/收藏 LRU 500）</li>
+<li>MetingApiService / NetworkMusicService / JamendoService（Jamendo 官方源）</li>
+<li>baidu/ — 百度 OAuth/网盘 API/流工厂（BaiduPanApi·BaiduStreamFactory）</li>
+<li>mv/ — Bilibili MV 搜索/播放</li>
+</ul></div>
+</div>
+<div class="grid g3" style="margin-top:12px">
+<div class="mod"><h4><code>backend/local</code> 本地音乐 <span class="meta">13 文件 · 2,078 行</span></h4><ul>
+<li>MusicScanner / MusicMerger / LocalMusicRepository（Room：LocalMusicDao）</li>
+<li>封面解析链：AlbumCoverResolver/ArtistCoverResolver → 嵌入提取 → iTunes 搜索兜底 → 持久缓存</li>
+<li>StorageMonitor — 存储挂载监听</li>
+</ul></div>
+<div class="mod"><h4><code>backend/download</code> 下载/导出 <span class="meta">15 文件 · 1,658 行</span></h4><ul>
+<li>SongDownloadManager / DownloadRepository（Room） / AutoDownloadController</li>
+<li>StreamUrlResolver（播放前懒解析）/ MediaTagWriter / CoverFileWriter</li>
+<li>StorageGuard — 存储守护</li>
+</ul></div>
+<div class="mod"><h4><code>backend</code> 其余域</h4><ul>
+<li><b>weather/</b> · 2 文件 — OpenWeatherMap + 天气电台情绪匹配（无 NAS 也可用）</li>
+<li><b>export/</b> · 3 文件 — ExportCoordinator 备份导出（applicationScope 注入 <span class="badge b-f">F-4</span>）</li>
+<li><b>radio/</b> · 1 文件 — 电台预设</li>
+</ul></div>
+</div>
+</div>
+<div class="flow-arrow">▼ DataStore（preferencesDataStore） · Room · 文件系统</div>
+<div class="layer layer-data">
+<h3>💾 数据层 <span class="meta">data/ + lyrics/ · 62 文件 · 4,497 行</span></h3>
+<div class="grid g3">
+<div class="mod"><h4><code>data/prefs</code> <span class="meta">14 文件 · 1,746 行 · 单类单文件</span> <span class="badge b-r">R-4</span><span class="badge b-n">N-2</span></h4><ul>
+<li><b>AppPreferences</b> — DataStore 单例门面；8 个 @Volatile 内存镜像消除 Main 线程 runBlocking <span class="badge b-r">R-7</span>；语言键 SharedPreferences 双写镜像（attachBaseContext 零 IO）；天气 API Key AES-GCM 加密 <span class="badge b-f">F-7</span></li>
+<li>12 个子 Prefs：Server/Player/Lyrics + NetworkMusic/Baidu/Download/Weather/Visualizer/History/Playlist/Queue/Language/Backup</li>
+</ul></div>
+<div class="mod"><h4><code>data/model</code> <span class="meta">42 文件 · 1,383 行</span></h4><ul>
+<li>Song/Album/Artist/Playlist/Genre + Network* 系列（网络音乐域）</li>
+<li>UiState&lt;T&gt; 泛型加载态 / Screen 枚举（导航）/ PlayMode</li>
+<li>Weather* / Lyrics* / CloudDriveConfig / BackupData</li>
+<li>Gson 序列化模型（ProGuard keep data.model）</li>
+</ul></div>
+<div class="mod"><h4><code>lyrics</code> 歌词域 <span class="meta">6 文件 · 1,368 行</span></h4><ul>
+<li><b>LyricsManager</b> · 384 — 优先级：本地缓存 → 后端 API/NetworkMusicManager → 网络模糊匹配（标题+歌手）；baseUrl 经 provider 注入即时生效 <span class="badge b-f">F-3</span></li>
+<li>LyricsNetworkProvider / LyricsPersistentCache（LRU+写互斥 <span class="badge b-f">F-5</span>）</li>
+<li>LocalLyricsProvider / LrcParser / Mp3MetadataExtractor</li>
+</ul></div>
+</div>
+</div>
+
+<h2>二、手动 DI 容器 <span style="font-size:14px;color:var(--muted)">NasMusicApp（Application.onCreate 构造全局实例，无框架）</span> <span class="badge b-no">R-8 定案不引入 Hilt</span></h2>
+<div class="di">
+<ol>
+<li>backendRegistry <em>BackendRegistry — 适配器注册</em></li>
+<li>appPreferences <em>AppPreferences — DataStore 门面</em></li>
+<li>playerManager <em>PlayerManager — 播放核心</em></li>
+<li>networkMusicManager <em>NetworkMusicManager — Meting/收藏</em></li>
+<li>mvSearchManager <em>MvSearchManager — MV 搜索</em></li>
+<li>searchAggregator <em>SearchAggregator — 多源聚合</em></li>
+<li>localMusicRepository <em>LocalMusicRepository — 本地库</em></li>
+<li>storageMonitor <em>StorageMonitor — 存储监听</em></li>
+<li>modelDownloadManager <em>ModelDownloadManager — ONNX 模型</em></li>
+<li>downloadRepository <em>DownloadRepository — 下载库</em></li>
+<li>storageGuard <em>StorageGuard — 存储守护</em></li>
+<li>songDownloadManager <em>SongDownloadManager</em></li>
+<li>autoDownloadController <em>AutoDownloadController</em></li>
+<li>exportCoordinator <em>ExportCoordinator — 备份导出</em></li>
+<li>baiduOAuthClient / baiduPanApi / baiduStreamFactory <em>lazy — 百度链</em></li>
+<li>baiduFileIndexCache <em>lazy — 网盘索引缓存</em></li>
+<li>downloadLyricsManager <em>lazy — 下载歌词</em></li>
+<li>applicationScope + startProviderMirrors <em>常驻收集 @Volatile 镜像 <span class="badge b-r">R-7</span></em></li>
+</ol>
+</div>
+<h2>三、基础设施层</h2>
+<div class="grid g2">
+<div class="layer layer-infra" style="margin-bottom:12px">
+<h3>🛠️ util/ <span class="meta">19 文件 · 1,421 行</span></h3>
+<ul style="list-style:none">
+<li><b>UrlSanitizer</b> — URL 凭证脱敏（api_key/token/密码），5 适配器日志接入 <span class="badge b-f">F-1</span></li>
+<li><b>EncodingUtils</b> — GBK/UTF-8 编码兜底（Jellyfin 中文 ID3 修复）</li>
+<li><b>PinyinUtils/PinyinMatcher</b> — TinyPinyin 拼音搜索（API 22 兼容，不用 ICU）</li>
+<li><b>CryptoUtils</b> — AES-GCM（凭据/天气 Key 加密存储）</li>
+<li>AppLog（release 剥离 d/v）/ NetworkUtils（双网卡优先级 <span class="badge b-f">F-6</span>）/ QrCodeGenerator / ArtistSplitter / MediaKeyHandler（媒体键路由）/ RetryUtil / HashUtils / BackupFileUtils / StorageUtils 等</li>
+</ul>
+</div>
+<div class="layer layer-infra" style="margin-bottom:12px">
+<h3>📡 net/ — 本地 HTTP 服务 <span class="meta">5 文件 · 1,633 行</span></h3>
+<ul style="list-style:none">
+<li><b>RemoteControlServer</b> + RemoteControlHtml — 手机遥控（浏览器遥控 TV，本地局域网无鉴权——所有者接受的家庭场景取舍）</li>
+<li><b>ModelTransferServer</b> — ONNX 模型扫码传输（166MB）</li>
+<li><b>BackupTransferServer</b> — 备份扫码传输</li>
+<li><b>LocalInputServer</b> — 手机文字输入代理（TV 输入框）</li>
+</ul>
+</div>
+</div>
+
+<h2>四、关键数据流</h2>
+<div class="grid g2">
+<div class="layer">
+<h3>▶ 播放一条歌（网络歌曲懒解析）</h3>
+<div class="stepflow">
+<span class="step"><b>UI 点击</b>Actions 回调</span><span class="arr">→</span>
+<span class="step"><b>PlayerViewModel</b>playQueue/playSong</span><span class="arr">→</span>
+<span class="step"><b>PlayerManager</b>buildMediaItem<br>setMediaItems+prepare</span><span class="arr">→</span>
+<span class="step"><b>ExoPlayer</b>（PlaybackService 注册）</span>
+</div>
+<p class="note">streamUrl 为空的网络歌曲：onMediaItemTransition(AUTO) → <code>onNeedResolveStreamUrl</code> 回调 → ViewModel 解析（Meting/Jamendo/百度流工厂）→ replay；播放出错且未重试过 → 重解析一次，仍失败自动跳下一首（防死循环）</p>
+</div>
+<div class="layer">
+<h3>▶ K 歌 HQ 人声分离 <span class="badge b-n">N-4</span></h3>
+<div class="stepflow">
+<span class="step"><b>VocalSeparationViewModel</b>setSeparationMode(HQ)</span><span class="arr">→</span>
+<span class="step"><b>HqSeparationOrchestrator</b>enableHighQualityRemoval</span><span class="arr">→</span>
+<span class="step"><b>resolveInputPath</b>本地文件或下载</span><span class="arr">→</span>
+<span class="step"><b>DemucsSeparator</b>ONNX 分离(IO)</span><span class="arr">→</span>
+<span class="step"><b>PlayerHost</b>切伴奏文件</span>
+</div>
+<p class="note">伴奏已缓存则直接切换；失败/超时/OOM 一律回退 FAST 模式 DSP（SpectralMaskProcessor）；原唱文件入 AccompanimentCache 供切回</p>
+</div>
+</div>
+<div class="grid g2" style="margin-top:12px">
+<div class="layer">
+<h3>▶ 多源曲库合并</h3>
+<div class="stepflow">
+<span class="step"><b>LibraryScreen</b>五 Tab 浏览</span><span class="arr">→</span>
+<span class="step"><b>MainViewModel</b>mergedAlbums/mergedArtists</span><span class="arr">→</span>
+<span class="step"><b>MusicMerger</b>NAS+本地+百度 三源合并</span><span class="arr">→</span>
+<span class="step"><b>UnifiedSongRow</b>来源徽章渲染</span>
+</div>
+<p class="note">百度索引经 baiduFileIndexCache 属性委托；NAS 收藏分支 toggleNasFavorite 留在 MainViewModel（依赖 _favoriteIds 状态）</p>
+</div>
+<div class="layer">
+<h3>▶ 后端切换（连接生命周期）</h3>
+<div class="stepflow">
+<span class="step"><b>ServerConnectScreen</b>输入地址凭据</span><span class="arr">→</span>
+<span class="step"><b>ServerViewModel</b>testConnection（一次性适配器，不动当前状态）</span><span class="arr">→</span>
+<span class="step"><b>BackendRegistry</b>切换活动适配器</span><span class="arr">→</span>
+<span class="step"><b>onConnected 回调</b>loadLibrary+恢复队列</span>
+</div>
+<p class="note">共享 OkHttp 池：适配器 close() 只清认证态，不 shutdown 全局线程池——连续切换不累积资源 <span class="badge b-r">R-6</span></p>
+</div>
+</div>
+<h2>五、重构成果速览 <span style="font-size:14px;color:var(--muted)">(docs/archive/codebase-refactoring-plan-2026-09.md v1.6 · 2026-09-10 全部完成)</span></h2>
+<div class="layer">
+<table>
+<tr><th style="width:70px">编号</th><th>主题</th><th>成果</th><th style="width:120px">状态</th></tr>
+<tr><td><code>R-1</code></td><td>MainViewModel 拆分</td><td>5451→3055 行；13 个领域子 VM + ViewModelEvents 契约；N-1 后子 VM 公开直调</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-2</code></td><td>SettingsScreen 拆分</td><td>2529→924 行；9 个 Section（State/Actions 签名）</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-3</code></td><td>LibraryScreen 拆分</td><td>1695→647 行；library/browse/ 5 文件，详情页复用</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-4</code></td><td>AppPreferences 门面</td><td>13 个子 Prefs；键不迁移只搬访问器；N-2 后单类单文件</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-5</code></td><td>人声分离提取</td><td>SeparationMode 上提 player 层；VocalSeparationController 窄接口</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-6</code></td><td>OkHttp 池化</td><td>共享 ConnectionPool/Dispatcher；close() 不再 shutdown</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-7</code></td><td>runBlocking 治理</td><td>11 处→3 处受控（@WorkerThread）；@Volatile 镜像 + 语言双写</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-8</code></td><td>Hilt 迁移</td><td colspan="2"><span class="tag b-no">定案不实施</span>（min SDK 22 + Kotlin 2.2.10 兼容性风险）</td></tr>
+<tr><td><code>R-9</code></td><td>代码规范清理</td><td>重复 import 清理；修复标记保留</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>R-10</code></td><td>适配器拆分</td><td>SubsonicRestClient 公共层；Jellyfin 定案保持原状</td><td><span class="tag b-ok">✅ 定案</span></td></tr>
+<tr><td><code>F-1</code></td><td>日志凭证脱敏</td><td>UrlSanitizer 接入 5 适配器，release 不泄露 token</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>F-2</code></td><td>AppRoot 重组热点</td><td>progress/duration 下沉播放页分支</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>F-3</code></td><td>歌词 baseUrl 急切求值</td><td>改 provider 注入，设置即时生效</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>F-4/F-5</code></td><td>scope/缓存互斥</td><td>applicationScope 统一注入；歌词缓存写互斥</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>F-6</code></td><td>双网卡 IP 选择</td><td>NetworkUtils 按接口优先级过滤</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>F-7</code></td><td>天气 Key 明文</td><td>AES-GCM 加密 + 一次性迁移</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>N-1</code></td><td>转发层消除</td><td>子 VM 公开直调；121 纯透传删除，12 胶水保留</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>N-2</code></td><td>DomainPrefs 拆文件</td><td>10 类→10 文件；data/prefs 14 文件</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>N-3</code></td><td>AppRoot 状态下沉</td><td>顶层订阅 35→18 处（≤20 达标）</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>N-4</code></td><td>PlayerManager 拆分</td><td>64.1→41.5KB；HqSeparationOrchestrator + PlayerEqualizer 提取</td><td><span class="tag b-ok">✅ 完成</span></td></tr>
+<tr><td><code>N-5</code></td><td>适配器再拆分</td><td colspan="2"><span class="tag b-no">归入 R-10 定案关闭</span>（Jellyfin 保持原状）</td></tr>
+</table>
+<p class="note">版本发布基线：v2.28.0（versionCode 122，2026-09-10）已 TV 手测基本功能有效；N 系列在 v2.28.0 之后实施，待随下一版本装包回归（重点：N-4 播放全路径 / N-1 遥控与导航 / N-3 四页 D-Pad）。质量门：assembleDebug + 270 单测全绿 + assembleRelease（R8/lintVital）。</p>
+</div>
+
+<h2>六、类级调用图谱 <span style="font-size:14px;color:var(--muted)">（可拖动 · 以类为单位 · 虚线外框=同文件多类 · 边=跨文件调用）</span></h2>
+<div id="graphWrap">
+  <div id="gtoolbar">
+    <button id="greset">重置布局</button>
+    <button id="gfit">适配视口</button>
+    <span class="glegend">
+      <span><i style="background:#ff7b72"></i>app</span>
+      <span><i style="background:#f778ba"></i>viewmodel</span>
+      <span><i style="background:#a371f7"></i>player</span>
+      <span><i style="background:#3fb950"></i>backend</span>
+      <span><i style="background:#58a6ff"></i>data</span>
+      <span><i style="background:#e3b341"></i>lyrics</span>
+      <span><i style="background:#ffa657"></i>net</span>
+      <span><i style="background:#8b949e"></i>util</span>
+    </span>
+  </div>
+  <div id="gsvgBox"><svg id="gsvg" xmlns="http://www.w3.org/2000/svg"><g id="groot"></g></svg></div>
+  <p class="ghint">节点=类（按层分列，层内同文件相邻，同文件多类以灰色虚线外框包围并标注文件名）；边=跨文件调用引用（箭头：调用方→被调方，透明度随调用频次增强；同文件内部引用不画边，由外框表达）。交互：拖动节点=移动类；拖空白处=平移画布；滚轮=缩放；悬停节点=高亮其直接调用关系。</p>
+</div>
+
+<footer>
+<p>NASMusicTV 代码架构图 · 生成于 2026-09-10 · 数据来源：代码库实测统计（252 文件 / 53,389 行）· 与 docs/technical-overview.md §10.113 对应</p>
+</footer>
+</div>
+
+<script>
+const GN=[["NasMusicApp","NasMusicApp.kt","app"],["BackupViewModel","BackupViewModel.kt","vm"],["DownloadViewModel","DownloadViewModel.kt","vm"],["LibraryEvent","ViewModelEvents.kt","vm"],["MainViewModel","MainViewModel.kt","vm"],["MvAvailability","MainViewModel.kt","vm"],["MvSearchViewModel","MvSearchViewModel.kt","vm"],["NavigationViewModel","NavigationViewModel.kt","vm"],["NetworkMusicEvent","ViewModelEvents.kt","vm"],["NetworkMusicViewModel","NetworkMusicViewModel.kt","vm"],["PlayHistoryViewModel","PlayHistoryViewModel.kt","vm"],["PlayerCommandHub","ViewModelEvents.kt","vm"],["PlayerEvent","ViewModelEvents.kt","vm"],["PlayerViewModel","PlayerViewModel.kt","vm"],["PlaylistViewModel","PlaylistViewModel.kt","vm"],["SearchEvent","ViewModelEvents.kt","vm"],["SearchViewModel","SearchViewModel.kt","vm"],["ServerViewModel","ServerViewModel.kt","vm"],["VocalSeparationViewModel","VocalSeparationViewModel.kt","vm"],["WeatherRadioEvent","ViewModelEvents.kt","vm"],["WeatherRadioViewModel","WeatherRadioViewModel.kt","vm"],["AccompanimentCache","AccompanimentCache.kt","player"],["BatteryOptimizationHelper","BatteryOptimizationHelper.kt","player"],["CoilBitmapLoader","CoilBitmapLoader.kt","player"],["DemucsSeparator","DemucsSeparator.kt","player"],["HqSeparationOrchestrator","HqSeparationOrchestrator.kt","player"],["MediaLibraryTree","MediaLibraryTree.kt","player"],["ModelDownloadManager","ModelDownloadManager.kt","player"],["PlaybackService","PlaybackService.kt","player"],["PlayerEqualizer","PlayerEqualizer.kt","player"],["PlayerManager","PlayerManager.kt","player"],["SeparationMode","SeparationMode.kt","player"],["SpectralMaskProcessor","SpectralMaskProcessor.kt","player"],["SpectrumAnalyzer","SpectrumAnalyzer.kt","player"],["VocalRemovalProcessor","VocalRemovalProcessor.kt","player"],["VocalSeparationController","VocalSeparationController.kt","player"],["AlbumCoverResolver","AlbumCoverResolver.kt","backend"],["AutoDownloadController","AutoDownloadController.kt","backend"],["BackendAdapter","BackendAdapter.kt","backend"],["BackendRegistry","BackendRegistry.kt","backend"],["DaoliyuAdapter","DaoliyuAdapter.kt","backend"],["DownloadRepository","DownloadRepository.kt","backend"],["DownloadResult","SongDownloadManager.kt","backend"],["DownloadStats","DownloadRepository.kt","backend"],["ExportCoordinator","ExportCoordinator.kt","backend"],["FeiniuAdapter","FeiniuAdapter.kt","backend"],["FilterMode","SearchAggregator.kt","backend"],["JamendoService","JamendoService.kt","backend"],["JellyfinAdapter","JellyfinAdapter.kt","backend"],["LocalMusicRepository","LocalMusicRepository.kt","backend"],["MetingApiService","MetingApiService.kt","backend"],["MusicMerger","MusicMerger.kt","backend"],["MusicScanner","MusicScanner.kt","backend"],["NavidromeAdapter","NavidromeAdapter.kt","backend"],["NetworkMusicManager","NetworkMusicManager.kt","backend"],["NetworkMusicService","NetworkMusicService.kt","backend"],["ScannedSong","MusicScanner.kt","backend"],["SearchAggregator","SearchAggregator.kt","backend"],["SearchType","SearchAggregator.kt","backend"],["SongDownloadManager","SongDownloadManager.kt","backend"],["StorageFullException","StorageGuard.kt","backend"],["StorageGuard","StorageGuard.kt","backend"],["StorageMonitor","StorageMonitor.kt","backend"],["StreamUrlResolver","StreamUrlResolver.kt","backend"],["SubsonicAdapter","SubsonicAdapter.kt","backend"],["WeatherApi","WeatherApi.kt","backend"],["WeatherRadioManager","WeatherRadioManager.kt","backend"],["AppPreferences","AppPreferences.kt","data"],["BackupPrefs","BackupPrefs.kt","data"],["BaiduPrefs","BaiduPrefs.kt","data"],["DownloadPrefs","DownloadPrefs.kt","data"],["HistoryPrefs","HistoryPrefs.kt","data"],["LanguagePrefs","LanguagePrefs.kt","data"],["LyricsPrefs","LyricsPrefs.kt","data"],["NetworkMusicPrefs","NetworkMusicPrefs.kt","data"],["PlayerPrefs","PlayerPrefs.kt","data"],["PlaylistPrefs","PlaylistPrefs.kt","data"],["QueuePrefs","QueuePrefs.kt","data"],["ServerPrefs","ServerPrefs.kt","data"],["VisualizerPrefs","VisualizerPrefs.kt","data"],["WeatherPrefs","WeatherPrefs.kt","data"],["LocalLyricsProvider","LocalLyricsProvider.kt","lyrics"],["LrcParser","LrcParser.kt","lyrics"],["LyricsManager","LyricsManager.kt","lyrics"],["LyricsNetworkProvider","LyricsNetworkProvider.kt","lyrics"],["LyricsPersistentCache","LyricsPersistentCache.kt","lyrics"],["Mp3MetadataExtractor","Mp3MetadataExtractor.kt","lyrics"],["BackupTransferServer","BackupTransferServer.kt","net"],["LocalInputServer","LocalInputServer.kt","net"],["ModelTransferServer","ModelTransferServer.kt","net"],["RemoteCallbacks","RemoteControlServer.kt","net"],["RemoteControlServer","RemoteControlServer.kt","net"],["RemoteSearchResult","RemoteControlServer.kt","net"],["AppLog","AppLog.kt","util"],["CryptoUtils","CryptoUtils.kt","util"],["EncodingUtils","EncodingUtils.kt","util"],["MediaKeyHandler","MediaKeyHandler.kt","util"],["NetworkMonitor","NetworkMonitor.kt","util"],["NetworkUtils","NetworkUtils.kt","util"],["PinyinUtils","PinyinUtils.kt","util"],["UrlSanitizer","UrlSanitizer.kt","util"]];
+const GE=[[4,93,80],[48,93,63],[9,93,47],[30,93,38],[50,93,35],[84,93,34],[53,93,31],[53,95,31],[64,95,29],[6,5,26],[64,93,24],[83,93,23],[25,93,22],[54,93,21],[6,93,20],[83,82,18],[13,93,18],[45,93,17],[40,93,17],[87,93,17],[24,93,14],[89,93,14],[25,31,12],[57,93,12],[48,95,12],[18,93,12],[18,67,12],[18,31,12],[29,93,11],[67,94,11],[67,93,11],[21,93,10],[39,93,10],[27,93,9],[33,93,9],[59,93,9],[28,0,8],[28,93,8],[45,95,8],[22,93,7],[40,95,7],[65,93,7],[67,31,7],[85,93,7],[16,93,7],[57,99,6],[49,56,6],[67,84,6],[81,93,6],[95,93,6],[1,93,6],[4,51,6],[16,58,6],[32,93,5],[34,93,5],[48,100,5],[47,93,5],[91,93,5],[88,93,5],[14,93,5],[20,66,5],[0,93,4],[35,31,4],[45,100,4],[54,55,4],[52,93,4],[83,84,4],[81,82,4],[2,43,4],[4,82,4],[17,93,4],[25,24,3],[39,38,3],[50,95,3],[62,93,3],[66,93,3],[67,50,3],[68,67,3],[94,93,3],[4,0,3],[4,38,3],[20,19,3],[20,93,3],[0,39,2],[0,67,2],[0,30,2],[0,54,2],[0,57,2],[0,49,2],[0,62,2],[0,27,2],[0,41,2],[0,61,2],[0,59,2],[0,37,2],[0,44,2],[0,83,2],[0,36,2],[0,47,2],[30,25,2],[30,32,2],[30,31,2],[25,21,2],[25,27,2],[35,32,2],[28,26,2],[26,0,2],[39,48,2],[39,53,2],[39,64,2],[39,40,2],[39,45,2],[48,39,2],[53,39,2],[64,39,2],[45,39,2],[40,39,2],[51,99,2],[49,93,2],[36,93,2],[59,60,2],[44,93,2],[67,78,2],[67,75,2],[67,73,2],[67,74,2],[67,69,2],[67,70,2],[67,80,2],[67,79,2],[67,71,2],[67,76,2],[67,77,2],[67,72,2],[67,68,2],[75,31,2],[77,67,2],[83,81,2],[82,93,2],[86,82,2],[97,93,2],[1,67,2],[4,92,2],[4,84,2],[0,50,1],[0,63,1],[0,82,1],[30,24,1],[30,21,1],[30,27,1],[30,67,1],[25,30,1],[29,30,1],[35,93,1],[35,21,1],[28,24,1],[28,21,1],[28,30,1],[21,24,1],[39,100,1],[57,39,1],[57,54,1],[48,38,1],[53,38,1],[64,38,1],[45,38,1],[40,38,1],[40,100,1],[59,41,1],[59,61,1],[59,63,1],[41,93,1],[37,41,1],[37,61,1],[37,63,1],[37,59,1],[63,38,1],[63,93,1],[61,93,1],[44,67,1],[44,41,1],[66,38,1],[66,54,1],[78,67,1],[75,67,1],[73,67,1],[74,67,1],[69,67,1],[70,67,1],[80,67,1],[79,67,1],[71,67,1],[76,67,1],[72,67,1],[83,39,1],[83,54,1],[98,93,1],[1,0,1],[2,59,1],[2,27,1],[2,0,1],[2,30,1],[4,13,1],[4,50,1],[6,30,1],[9,0,1],[10,0,1],[13,30,1],[13,0,1],[14,0,1],[16,39,1],[16,0,1],[17,39,1],[17,0,1],[15,13,1],[3,13,1],[19,13,1],[12,67,1],[12,13,1],[8,13,1],[18,30,1],[18,0,1],[20,30,1],[20,54,1],[20,0,1]];
+const GMULTI={"backend/SearchAggregator.kt":["FilterMode","SearchAggregator","SearchType"],"backend/local/MusicScanner.kt":["MusicScanner","ScannedSong"],"backend/download/SongDownloadManager.kt":["DownloadResult","SongDownloadManager"],"backend/download/DownloadRepository.kt":["DownloadRepository","DownloadStats"],"backend/download/StorageGuard.kt":["StorageFullException","StorageGuard"],"net/RemoteControlServer.kt":["RemoteCallbacks","RemoteControlServer","RemoteSearchResult"],"ui/viewmodel/MainViewModel.kt":["MainViewModel","MvAvailability"],"ui/viewmodel/ViewModelEvents.kt":["LibraryEvent","NetworkMusicEvent","PlayerCommandHub","PlayerEvent","SearchEvent","WeatherRadioEvent"]};
+(function(){
+'use strict';
+const svg=document.getElementById('gsvg'),root=document.getElementById('groot');
+const NS='http://www.w3.org/2000/svg';
+const LORDER=['app','vm','player','backend','data','lyrics','net','util'];
+const LC={app:'#ff7b72',vm:'#f778ba',player:'#a371f7',backend:'#3fb950',data:'#58a6ff',lyrics:'#e3b341',net:'#ffa657',util:'#8b949e'};
+const NH=24,VG=12,COLW=250,PX=100,PY=46;
+const nodes=GN.map(g=>({name:g[0],file:g[1],layer:g[2],w:0,x:0,y:0,el:null}));
+nodes.forEach(n=>n.w=Math.max(86,n.name.length*7.4+18));
+const fidx={};GN.forEach((g,i)=>fidx[g[0]]=i);
+const col={};LORDER.forEach(l=>col[l]=[]);
+nodes.forEach((n,i)=>col[n.layer].push(i));
+for(const l of LORDER)col[l].sort((a,b)=>nodes[a].file.localeCompare(nodes[b].file)||nodes[a].name.localeCompare(nodes[b].name));
+const initPos=()=>{LORDER.forEach(l=>{let y=PY;col[l].forEach(i=>{nodes[i].x=PX+LORDER.indexOf(l)*COLW;nodes[i].y=y;y+=NH+VG;});});};
+initPos();
+const mk=(t,at,parent)=>{const e=document.createElementNS(NS,t);for(const k in at)e.setAttribute(k,at[k]);(parent||root).appendChild(e);return e;};
+const defs=mk('defs',{});
+const mk0=mk('marker',{id:'garrow',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'},defs);
+mk('path',{d:'M0,0 L10,5 L0,10 z',fill:'#58a6ff'},mk0);
+const gE=mk('g',{}),gC=mk('g',{}),gN=mk('g',{});
+nodes.forEach((n,i)=>{
+ const g=mk('g',{class:'gnode'},gN);
+ g.dataset.i=i;n.el=g;
+ mk('rect',{x:0,y:0,width:n.w,height:NH,rx:5,stroke:LC[n.layer]},g);
+ const t=mk('text',{x:n.w/2,y:16,'text-anchor':'middle'},g);
+ t.textContent=n.name;
+ const ti=mk('title',{},g);ti.textContent=n.file+' · '+n.layer;
+});
+const epath=ei=>{const s=nodes[GE[ei][0]],t=nodes[GE[ei][1]];
+ const sx=s.x+s.w/2,sy=s.y+NH/2,tx=t.x+t.w/2,ty=t.y+NH/2,mx=(sx+tx)/2;
+ return 'M'+sx+','+sy+' C'+mx+','+sy+' '+mx+','+ty+' '+tx+','+ty;};
+const eEls=[];
+GE.forEach((e,ei)=>{
+ const op=Math.min(.55,.1+Math.log2(1+e[2])*.07);
+ eEls.push(mk('path',{class:'gedge',d:epath(ei),'stroke-width':Math.min(3,.8+Math.log2(1+e[2])*.25),'stroke-opacity':op,'marker-end':'url(#garrow)'},gE));
+});
+const clusterEls=[];
+Object.keys(GMULTI).forEach(f=>{
+ const members=GMULTI[f].map(nm=>fidx[nm]);
+ const r=mk('rect',{class:'gcluster'},gC);
+ const lb=mk('text',{class:'gclabel'},gC);lb.textContent=f.split('/').pop();
+ clusterEls.push({members,r,lb});
+});
+const layoutClusters=()=>{clusterEls.forEach(c=>{
+ let x1=1e9,y1=1e9,x2=-1e9,y2=-1e9;
+ c.members.forEach(i=>{const n=nodes[i];x1=Math.min(x1,n.x);y1=Math.min(y1,n.y);x2=Math.max(x2,n.x+n.w);y2=Math.max(y2,n.y+NH);});
+ c.r.setAttribute('x',x1-8);c.r.setAttribute('y',y1-18);c.r.setAttribute('width',x2-x1+16);c.r.setAttribute('height',y2-y1+26);
+ c.lb.setAttribute('x',x1-2);c.lb.setAttribute('y',y1-22);
+});};
+const placeNodes=()=>{nodes.forEach(n=>n.el.setAttribute('transform','translate('+n.x+','+n.y+')'));
+ GE.forEach((e,ei)=>eEls[ei].setAttribute('d',epath(ei)));layoutClusters();};
+placeNodes();
+let vt={x:0,y:0,s:1};
+const apply=()=>root.setAttribute('transform','translate('+vt.x+','+vt.y+') scale('+vt.s+')');
+const clientPt=e=>{const r=svg.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};};
+const toWorld=p=>({x:(p.x-vt.x)/vt.s,y:(p.y-vt.y)/vt.s});
+const fit=()=>{let x1=1e9,y1=1e9,x2=-1e9,y2=-1e9;
+ nodes.forEach(n=>{x1=Math.min(x1,n.x);y1=Math.min(y1,n.y);x2=Math.max(x2,n.x+n.w);y2=Math.max(y2,n.y+NH);});
+ const r=svg.getBoundingClientRect(),pad=30;
+ const s=Math.max(.08,Math.min(2.5,Math.min((r.width-pad*2)/(x2-x1),(r.height-pad*2)/(y2-y1))));
+ vt.s=s;vt.x=(r.width-(x2-x1)*s)/2-x1*s;vt.y=(r.height-(y2-y1)*s)/2-y1*s;apply();};
+let drag=null;
+svg.addEventListener('pointerdown',e=>{
+ const g=e.target.closest?e.target.closest('.gnode'):null;
+ if(g){const i=+g.dataset.i,p=toWorld(clientPt(e));
+  drag={node:i,dx:p.x-nodes[i].x,dy:p.y-nodes[i].y};g.setPointerCapture(e.pointerId);}
+ else{const p=clientPt(e);drag={pan:true,sx:p.x,sy:p.y,ox:vt.x,oy:vt.y};svg.setPointerCapture(e.pointerId);}
+ svg.style.cursor='grabbing';e.preventDefault();
+});
+svg.addEventListener('pointermove',e=>{
+ if(!drag)return;
+ if(drag.pan){const p=clientPt(e);vt.x=drag.ox+(p.x-drag.sx);vt.y=drag.oy+(p.y-drag.sy);apply();}
+ else{const n=nodes[drag.node],p=toWorld(clientPt(e));n.x=p.x-drag.dx;n.y=p.y-drag.dy;
+  n.el.setAttribute('transform','translate('+n.x+','+n.y+')');
+  GE.forEach((ed,ei)=>{if(ed[0]===drag.node||ed[1]===drag.node)eEls[ei].setAttribute('d',epath(ei));});
+  layoutClusters();}
+});
+const endDrag=()=>{drag=null;svg.style.cursor='grab';};
+svg.addEventListener('pointerup',endDrag);svg.addEventListener('pointercancel',endDrag);
+svg.addEventListener('wheel',e=>{e.preventDefault();const p=clientPt(e),f=Math.pow(1.0015,-e.deltaY);
+ const ns=Math.max(.08,Math.min(3,vt.s*f));vt.x=p.x-(p.x-vt.x)*ns/vt.s;vt.y=p.y-(p.y-vt.y)*ns/vt.s;vt.s=ns;apply();},{passive:false});
+nodes.forEach((n,i)=>{
+ n.el.addEventListener('pointerenter',()=>{
+  const rel=new Set([i]);
+  GE.forEach((ed,ei)=>{const h=ed[0]===i||ed[1]===i;eEls[ei].classList.toggle('hl',h);eEls[ei].classList.toggle('dim',!h);if(h){rel.add(ed[0]);rel.add(ed[1]);}});
+  nodes.forEach((m,j)=>m.el.classList.toggle('dim',!rel.has(j)));
+ });
+ n.el.addEventListener('pointerleave',()=>{
+  eEls.forEach(p=>{p.classList.remove('hl');p.classList.remove('dim');});
+  nodes.forEach(m=>m.el.classList.remove('dim'));
+ });
+});
+document.getElementById('greset').addEventListener('click',()=>{initPos();placeNodes();fit();});
+document.getElementById('gfit').addEventListener('click',fit);
+fit();
+})();
+</script>
+</body>
+</html>

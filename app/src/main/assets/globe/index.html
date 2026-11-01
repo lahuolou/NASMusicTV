@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <!--
+    显式声明空 favicon：否则 WebView 会**自动**向域根 https://appassets.androidplatform.net/favicon.ico
+    发请求（2026-10-20 真机实测；该保留域无公网 DNS ⇒ ERR_NAME_NOT_RESOLVED 噪音）。
+    data: 空 URI 满足「有图标」语义，浏览器就不再自动探测。Kotlin 侧
+    shouldInterceptRequest 的 host 级拦截是第二道防线（双保险，勿删其一）。
+  -->
+  <link rel="icon" href="data:,">
+  <title>WorldGlobe</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    #globe-container {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <!--
+    NASMusicTV「世界」可视化 — 3D 地球（完全离线）。
+    仅加载本地相对路径脚本，运行时零网络。
+    three.js r160 UMD（r161+ 起 npm 不再发布 UMD 构建；r160 是 ≤r162 中
+    最后一个带 UMD three.min.js 的版本，WebGL1 兜底支持完好）。
+    three-globe 2.45.2 UMD（peerDependency three >=0.154，兼容 r160）。
+  -->
+  <!--
+    加载 ES5 降级产物。电视（创维 9R54_G8S / Android 5.1.1）系统 WebView 是 **Chrome 39**，
+    解析不了 class / 箭头函数 / let / 模板串（实测 SyntaxError；const / for-of / generator 可用），
+    加载 ES6 原版会黑屏。详见 docs/technical-overview.md §10.201。
+
+    顺序不可调换：polyfill 必须最先 —— 降级只转语法，库依然会调
+    Object.assign / Array.from 等 Chrome 39 缺失的 API。
+
+    ⛔ 降级器是 **TypeScript**，⛔ 不是 Babel。
+       Babel preset-env targets:{chrome:"39"} 的产物**运行时初始化即崩**
+       （TypeError: e.Box3 is not a constructor），已排除 terser（mangle/compress
+       全关、乃至完全不压缩共 5 组配置同样报错）与 UMD 实参（两版传的是同一对象）。
+       → 缺陷在 Babel 的 class 降级语义本身。改降级器前先读 downlevel_libs.mjs。
+
+    ⚠️ ES5 语法校验（acorn ecmaVersion=5）**只证明语法，不证明运行时**。
+       任何改动都必须配 vm 加载测试：删掉 Chrome 39 缺失的 API 后按本顺序加载全链路。
+
+    ⛔ three.min.js / three-globe.min.js（ES6 原版）：**永久保留、永不删除、永不修改**。
+       它们是 ES5 产物的**再生源与比对基线**——产物出问题时必须能逐字节 diff 回上游，
+       确认差异只来自降级而非库的版本漂移或误改。
+       ⛔ 2026-10-07 起它们**不在本目录**（本目录只留运行时装载的 9 个文件），
+       已移至 `app/src/globe-upstream/`，与 `downlevel_libs.mjs`、`earth.jpg`、
+       `cities.json` 同处。移出而不删除，是为了既不进 APK（实测省 2.02 MiB）
+       又保住可再生性。
+  -->
+  <div id="globe-container"></div>
+
+  <script src="./polyfill.es5.js"></script>
+  <script src="./three.es5.js"></script>
+  <script src="./three-globe.es5.js"></script>
+  <script src="./globe.js"></script>
+</body>
+</html>

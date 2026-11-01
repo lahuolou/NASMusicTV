@@ -1,0 +1,447 @@
+package com.nasmusic.tv.backend.network.mv
+
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.nasmusic.tv.R
+import com.nasmusic.tv.data.model.MvInfo
+import com.nasmusic.tv.data.model.MvCandidate
+import com.nasmusic.tv.data.model.MvSearchResult
+import com.nasmusic.tv.data.model.Song
+import com.nasmusic.tv.util.AppLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+
+/**
+ * Bilibili MV（音乐视频）搜索服务实现
+ *
+ * 三步取流：
+ * 1. 搜索 → 拿 bvid：`GET {base}/x/web-interface/wbi/search/type?search_type=video&keyword=<title+artist>`
+ *    （未登录有风控风险，失败时回退非 wbi 变体 `/x/web-interface/search/type`）
+ * 2. 拿 cid：`GET {base}/x/web-interface/view?bvid=<bvid>` → cid/title/pic/duration
+ * 3. 拿播放直链：`GET {base}/x/player/playurl?bvid=<bvid>&cid=<cid>&fnval=1` → durl[].url
+ *
+ * 防盗链：所有请求需带 `Referer: https://www.bilibili.com` + 浏览器 UA。
+ * 直链有有效期（小时级），由 MvSearchManager 的内存缓存 TTL 负责过期重建。
+ * 网络/解析/风控错误一律吞掉返回 null（MTV 按钮置暗即可，不打扰用户）。
+ *
+ * 端点可配置：设置页「网络 > 视频端点」选取，baseUrlProvider 每次请求时读取
+ * （支持官方端点或自建代理/镜像，路径结构保持一致）。
+ *
+ * 对应 docs/archive/mv-karaoke-feature-proposal.md §2.2 / Step 1
+ */
+class BilibiliMvService(
+    /**
+     * 运行时获取 B 站 API 基础端点（如 https://api.bilibili.com）。
+     * 由 AppPreferences.getMvApiBaseUrlSync() 提供，支持设置页运行时切换。
+     */
+    private val baseUrlProvider: () -> String = { DEFAULT_BASE_URL }
+) : MvSearchService {
+
+    /** 守护线程池：防止 OkHttp 非守护线程阻止进程退出（与 MetingApiService 一致） */
+    private val daemonExecutor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+        Thread(r, "BiliMv-OkHttp").apply { isDaemon = true }
+    }
+
+    // 安全修复（C-1）：移除 trust-all，使用系统默认证书校验（详见 BaiduOAuthClient.buildClient 注释）。
+
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .dispatcher(okhttp3.Dispatcher(daemonExecutor))
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val gson = Gson()
+
+    // ── WBI 签名（B 站 2023 起对 /wbi/ 路径强校验，缺失签名会返回 -412）──
+    /** 缓存的 (imgKey, subKey) */
+    @Volatile private var wbiKeys: Pair<String, String>? = null
+    @Volatile private var wbiKeysFetchedAt: Long = 0L
+    private val wbiLock = Any()
+
+    /** 当前基础端点（每次请求动态读取，清理非法字符，与 MetingApiService 一致） */
+    private val baseUrl: String
+        get() = baseUrlProvider()
+            .trim()
+            .trim('`', '\'', '"')
+            .trim()
+            .trimEnd('/')
+
+    override suspend fun searchMv(
+        title: String,
+        artist: String,
+        excludeBvids: Set<String>,
+        minSimilarity: Float,
+        song: Song?
+    ): MvSearchResult? = withContext(Dispatchers.IO) {
+        try {
+            val keyword = buildKeyword(title, artist)
+            if (keyword.isBlank()) {
+                AppLog.d(TAG, "searchMv: empty keyword")
+                return@withContext null
+            }
+            AppLog.d(TAG, "searchMv: keyword='$keyword' exclude=${excludeBvids.size} minSim=$minSimilarity")
+
+            val candidates = searchCandidates(keyword, excludeBvids, minSimilarity)
+            if (candidates.isEmpty()) {
+                AppLog.d(TAG, "searchMv: no candidates for '$keyword'")
+                return@withContext null
+            }
+
+            // 解析最佳候选的直链；失败则尝试下一个
+            val best = candidates[0]
+            val mv = resolveMvInternal(best.bvid) ?: run {
+                if (candidates.size > 1) {
+                    AppLog.d(TAG, "searchMv: best resolve failed, trying ${candidates[1].bvid}")
+                    resolveMvInternal(candidates[1].bvid)?.also { resolved ->
+                        return@withContext MvSearchResult(resolved, candidates.filter { it.bvid != candidates[1].bvid })
+                    }
+                }
+                AppLog.w(TAG, "searchMv: resolve failed for all candidates")
+                return@withContext null
+            }
+
+            AppLog.d(TAG, "searchMv: OK '${mv.title}' url=${mv.videoUrl.take(60)} candidates=${candidates.size}")
+            MvSearchResult(mv, candidates.drop(1))
+        } catch (e: Exception) {
+            AppLog.e(TAG, "searchMv failed: ${e.message}", e)
+            null
+        }
+    }
+
+    override suspend fun resolveMv(bvid: String): MvInfo? = withContext(Dispatchers.IO) {
+        resolveMvInternal(bvid)
+    }
+
+    /** 解析指定 bvid 的直链（searchMv 和 resolveMv 共用） */
+    private fun resolveMvInternal(bvid: String): MvInfo? {
+        val videoInfo = getVideoInfo(bvid) ?: return null
+        val playUrl = getPlayUrl(videoInfo) ?: return null
+        return MvInfo(
+            bvid = bvid,
+            title = videoInfo.title,
+            coverUrl = videoInfo.pic,
+            videoUrl = playUrl,
+            durationMs = videoInfo.durationSeconds * 1000L
+        )
+    }
+
+    /**
+     * 组合搜索关键词：标题 艺术家。
+     * 艺术家若有多个（逗号/斜杠分隔）只取第一个，避免关键词过长降低匹配率。
+     */
+    private fun buildKeyword(title: String, artist: String): String {
+        val t = title.trim()
+        val firstArtist = artist.trim().split('/', '、', ',', '，', '&')[0].trim()
+        return if (firstArtist.isEmpty()) t else "$t $firstArtist"
+    }
+
+    /**
+     * Step 1 - 搜索：先试 wbi 搜索接口，失败（风控 412/异常）回退非 wbi 变体。
+     * 返回按相似度排序的候选列表（含 bvid / 标题 / 封面）。
+     */
+    private fun searchCandidates(keyword: String, excludeBvids: Set<String>, minSimilarity: Float): List<MvCandidate> {
+        // 1. wbi 路径（必需 WBI 签名，否则 -412）
+        val signed = signWbi(mapOf("search_type" to "video", "keyword" to keyword))
+        if (signed != null) {
+            val wbiBody = execGet("$baseUrl/x/web-interface/wbi/search/type?$signed")
+            wbiBody?.let { parseCandidatesFromSearch(it, keyword, excludeBvids, minSimilarity)?.let { r -> return r } }
+        }
+        // 2. 回退：非 wbi 变体（部分镜像/代理不校验签名；官方端点通常已不可用）
+        val legacyQuery = "search_type=video&keyword=${URLEncoder.encode(keyword, "UTF-8")}"
+        val legacyBody = execGet("$baseUrl/x/web-interface/search/type?$legacyQuery")
+        return legacyBody?.let { parseCandidatesFromSearch(it, keyword, excludeBvids, minSimilarity) } ?: emptyList()
+    }
+
+    /**
+     * 解析搜索结果：返回按相似度排序的候选列表（≥ 阈值），含 bvid / 标题 / 封面。
+     * null 表示接口异常；空列表表示正常但无匹配。
+     */
+    internal fun parseCandidatesFromSearch(
+        body: String,
+        keyword: String,
+        excludeBvids: Set<String> = emptySet(),
+        minSimilarity: Float = MIN_SIMILARITY
+    ): List<MvCandidate>? {
+        try {
+            val json = gson.fromJson(body, JsonObject::class.java) ?: return null
+            if (json.get("code")?.asInt != 0) {
+                AppLog.w(TAG, "search: code=${json.get("code")}")
+                return null
+            }
+            val resultArr = json.getAsJsonObject("data")?.getAsJsonArray("result") ?: return null
+            data class ScoredCandidate(val candidate: MvCandidate, val score: Float)
+            val scored = mutableListOf<ScoredCandidate>()
+            for (item in resultArr) {
+                val obj = item?.asJsonObject ?: continue
+                if (obj.get("type")?.asString != "video") continue
+                val bvid = obj.get("bvid")?.asString ?: continue
+                if (bvid in excludeBvids) continue // 排除已展示的
+                val title = stripHtml(obj.get("title")?.asString ?: "")
+                val pic = obj.get("pic")?.asString?.let { if (it.startsWith("//")) "https:$it" else it }
+                val score = similarity(title, keyword)
+                if (score >= minSimilarity) {
+                    scored.add(ScoredCandidate(MvCandidate(bvid, title, pic), score))
+                }
+            }
+            val sorted = scored.sortedByDescending { it.score }.map { it.candidate }
+            val limited = sorted.take(MAX_CANDIDATES)
+            AppLog.d(TAG, "search: ${scored.size} matched (excluded ${excludeBvids.size}), returning ${limited.size}")
+            return limited
+        } catch (e: Exception) {
+            AppLog.w(TAG, "search parse failed: ${e.message}", e)
+            return null
+        }
+    }
+
+    /**
+     * Step 2 — 拿视频信息（cid/title/pic/duration）。
+     * 对应 `GET /x/web-interface/view?bvid=` 响应 data 字段。
+     */
+    private fun getVideoInfo(bvid: String): VideoInfo? {
+        val body = execGet("$baseUrl/x/web-interface/view?bvid=${URLEncoder.encode(bvid, "UTF-8")}") ?: return null
+        return try {
+            val json = gson.fromJson(body, JsonObject::class.java) ?: return null
+            if (json.get("code")?.asInt != 0) return null
+            val data = json.getAsJsonObject("data") ?: return null
+            val cid = data.get("cid")?.asLong ?: return null
+            VideoInfo(
+                bvid = bvid,
+                cid = cid,
+                title = data.get("title")?.asString ?: "",
+                pic = data.get("pic")?.asString,
+                durationSeconds = data.get("duration")?.asLong ?: 0L
+            )
+        } catch (e: Exception) {
+            AppLog.w(TAG, "view parse failed: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
+     * Step 3 — 拿播放直链。fnval=1 → durl 分片列表。
+     * 优先取 durl[0].url（含防盗链 Referer 校验，需请求头）。若 durl 缺失回退 DASH baseUrl。
+     */
+    private fun getPlayUrl(info: VideoInfo): String? {
+        val body = execGet(
+            "$baseUrl/x/player/playurl?bvid=${URLEncoder.encode(info.bvid, "UTF-8")}&cid=${info.cid}&fnval=1"
+        ) ?: return null
+        return try {
+            extractPlayUrl(body)
+        } catch (e: Exception) {
+            AppLog.w(TAG, "playurl parse failed: ${e.message}", e)
+            null
+        }
+    }
+
+    /** 从 playurl 响应提取直链：优先 durl[].url，其次 dash.video[].baseUrl */
+    internal fun extractPlayUrl(body: String): String? {
+        try {
+            val json = gson.fromJson(body, JsonObject::class.java) ?: return null
+            if (json.get("code")?.asInt != 0) return null
+            val data = json.getAsJsonObject("data") ?: return null
+
+            val durl = data.getAsJsonArray("durl")
+            if (durl != null) {
+                for (item in durl) {
+                    val url = item?.asJsonObject?.get("url")?.asString
+                    if (!url.isNullOrBlank()) return url
+                }
+            }
+            val dash = data.getAsJsonObject("dash")
+            val dashVideo = dash?.getAsJsonArray("video")
+            if (dashVideo != null) {
+                for (item in dashVideo) {
+                    val url = item?.asJsonObject?.get("baseUrl")?.asString
+                    if (!url.isNullOrBlank()) return url
+                }
+            }
+            return null
+        } catch (e: Exception) {
+            AppLog.w(TAG, "extractPlayUrl parse failed: ${e.message}", e)
+            return null
+        }
+    }
+
+    // ── WBI 签名实现 ──
+
+    /**
+     * 获取 mixinKey：从 /x/web-interface/nav 读取 img_url/sub_url 的文件名，
+     * 拼接后按固定置换表重排取前 32 位。带 12 小时缓存。
+     * 注意：未登录时 nav 返回 code=-101，但 data.wbi_img 仍然可用，不能按 code 判失败。
+     */
+    private fun getMixinKey(): String? {
+        val now = System.currentTimeMillis()
+        synchronized(wbiLock) {
+            val cached = wbiKeys
+            if (cached != null && now - wbiKeysFetchedAt < WBI_KEY_TTL_MS) {
+                return mixinKeyOf(cached.first, cached.second)
+            }
+        }
+        val body = execGet("$baseUrl/x/web-interface/nav") ?: return null
+        return try {
+            val json = gson.fromJson(body, JsonObject::class.java) ?: return null
+            val wbi = json.getAsJsonObject("data")?.getAsJsonObject("wbi_img") ?: return null
+            val imgUrl = wbi.get("img_url")?.asString ?: return null
+            val subUrl = wbi.get("sub_url")?.asString ?: return null
+            val imgKey = imgUrl.substringAfterLast('/').substringBeforeLast('.')
+            val subKey = subUrl.substringAfterLast('/').substringBeforeLast('.')
+            if (imgKey.isBlank() || subKey.isBlank()) return null
+            synchronized(wbiLock) {
+                wbiKeys = imgKey to subKey
+                wbiKeysFetchedAt = now
+            }
+            AppLog.d(TAG, "getMixinKey: refreshed (img=${imgKey.take(8)}… sub=${subKey.take(8)}…)")
+            mixinKeyOf(imgKey, subKey)
+        } catch (e: Exception) {
+            AppLog.w(TAG, "getMixinKey failed: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun mixinKeyOf(imgKey: String, subKey: String): String {
+        val orig = imgKey + subKey
+        val sb = StringBuilder(32)
+        for (i in WBI_MIXIN_TAB) if (i < orig.length) sb.append(orig[i])
+        return sb.toString().take(32)
+    }
+
+    /**
+     * 对查询参数做 WBI 签名，返回附加 wts/w_rid 的完整查询串（已按 key 升序）。
+     * 值需先剔除 !'()* 再百分号编码（空格用 %20，与 B 站服务端一致）。
+     */
+    private fun signWbi(params: Map<String, String>): String? {
+        val mixinKey = getMixinKey() ?: run {
+            AppLog.d(TAG, "signWbi: mixinKey unavailable, skip wbi signing")
+            return null
+        }
+        val withTs = params.toMutableMap()
+        withTs["wts"] = (System.currentTimeMillis() / 1000).toString()
+        val query = withTs.entries
+            .sortedBy { it.key }
+            .joinToString("&") { (k, v) -> "$k=${wbiEncode(v)}" }
+        val wRid = md5Hex(query + mixinKey)
+        return "$query&w_rid=$wRid"
+    }
+
+    /** B 站口径的百分号编码：剔除 !'()*、空格转 %20、其余按 UTF-8 */
+    private fun wbiEncode(value: String): String =
+        URLEncoder.encode(value.filterNot { it in "!'()*" }, "UTF-8").replace("+", "%20")
+
+    private fun md5Hex(input: String): String {
+        val digest = java.security.MessageDigest.getInstance("MD5").digest(input.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    /** 执行 GET，带 B 站防盗链必需的 Referer + 浏览器 UA；出错返回 null */
+    private fun execGet(url: String): String? {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("Referer", "https://www.bilibili.com")
+                .header("User-Agent", UA)
+                .get()
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    AppLog.d(TAG, "GET ${url.requestUrl()} failed: ${resp.code}")
+                    null
+                } else {
+                    resp.body?.string()
+                }
+            }
+        } catch (e: Exception) {
+            AppLog.d(TAG, "GET ${url.requestUrl()} error: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun String.requestUrl(): String = take(90)
+
+    /** 去掉 B 站搜索结果标题中的 <em class="keyword"> 高亮标签 */
+    private fun stripHtml(s: String): String = s.replace(HTML_TAG_REGEX, "").trim()
+
+    /**
+     * 标题相似度（0..1）：
+     * - 完全相等 → 1.0
+     * - 包含关系（标题含关键词 或 关键词含标题）→ 0.9/0.8
+     * - 否则按关键词字符在标题中的顺序覆盖率打分
+     */
+    private fun similarity(target: String, keyword: String): Float {
+        val t = target.lowercase()
+        val k = keyword.lowercase()
+        if (t.isBlank() || k.isBlank()) return 0f
+        if (t == k) return 1f
+        if (t.contains(k)) return 0.9f
+        if (k.contains(t)) return 0.8f
+        var pos = 0
+        var matched = 0
+        for (c in k) {
+            val found = t.indexOf(c, pos)
+            if (found >= 0) { matched++; pos = found + 1 }
+        }
+        return matched.toFloat() / k.length
+    }
+
+    /** video info 中间结果 */
+    private data class VideoInfo(
+        val bvid: String,
+        val cid: Long,
+        val title: String,
+        val pic: String?,
+        val durationSeconds: Long
+    )
+
+    companion object {
+        private const val TAG = "BilibiliMvService"
+
+        /** 预编译的 HTML 标签正则，避免每次解析 MV 标题时重复编译 */
+        private val HTML_TAG_REGEX = Regex("<[^>]+>")
+
+        // 默认 B 站官方 API 端点
+        const val DEFAULT_BASE_URL = "https://api.bilibili.com"
+
+        /**
+         * 设置页「网络 > 视频端点」的**候选项**（供用户勾选）。
+         *
+         * ⛔ **这不是运行期 failover 链**——本服务只有 [baseUrlProvider] 一个端点，
+         * 没有 `buildEndpointFallbackOrder`、没有遍历端点的循环。用户在设置页选中的那个
+         * URL 由 `AppPreferences.getMvApiBaseUrlSync()` 读出、经 `baseUrlProvider` 生效，
+         * 这份列表本身只在 UI 里渲染。
+         *
+         * ⚠️ **与 `MetingApiService.PRESET_ENDPOINTS` 同名不同义**（故刻意取名不同）：
+         * 那一份是真被 `buildEndpointFallbackOrder` 当运行期 failover 链消费的（3 个端点），
+         * 这一份只是可选列表（1 个端点）。别照着 Meting 那边给它加注入接缝——
+         * 它没有会被单测触发的端点链，加了就是凭空多一个参数。
+         */
+        val ENDPOINT_OPTIONS: List<Pair<Int, String>> = listOf(
+            R.string.mv_endpoint_bili_default to DEFAULT_BASE_URL
+        )
+
+        /** 浏览器 UA（B 站防盗链检查之一） */
+        private const val UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        /** 标题相似度最低阈值（低于则视为无匹配） */
+        private const val MIN_SIMILARITY = 0.5f
+
+        /** WBI 密钥缓存有效期（12 小时；B 站按日轮换） */
+        private const val WBI_KEY_TTL_MS = 12 * 60 * 60 * 1000L
+
+        /** WBI mixinKey 固定置换表（官方顺序） */
+        private val WBI_MIXIN_TAB = intArrayOf(
+            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+            33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+            26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+            20, 34, 44, 52
+        )
+
+        /** 候选列表上限（按相似度取前 N 条，避免切换轮次过长） */
+        private const val MAX_CANDIDATES = 5
+    }
+}

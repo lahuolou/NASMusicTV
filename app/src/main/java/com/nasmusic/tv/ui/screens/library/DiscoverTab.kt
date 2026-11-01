@@ -1,0 +1,299 @@
+package com.nasmusic.tv.ui.screens.library
+
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.annotation.StringRes
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.Text
+import com.nasmusic.tv.R
+import com.nasmusic.tv.backend.download.model.DownloadState
+import com.nasmusic.tv.backend.download.model.downloadKey
+import com.nasmusic.tv.data.model.Song
+import com.nasmusic.tv.ui.LocalListBackHandler
+import com.nasmusic.tv.ui.components.FocusableSurface
+import com.nasmusic.tv.ui.components.common.LoadingIndicator
+import com.nasmusic.tv.ui.components.common.SectionHeader
+import com.nasmusic.tv.ui.components.song.UnifiedSongRow
+import com.nasmusic.tv.ui.components.song.SongRowMode
+import com.nasmusic.tv.ui.components.songGridColumns
+import com.nasmusic.tv.ui.theme.FontSize
+import com.nasmusic.tv.ui.theme.NasMusicColors
+import kotlinx.coroutines.launch
+import com.nasmusic.tv.backend.download.model.stateOfSong
+
+/**
+ * 多维度浏览的单个选项（索引化——选项名本地化后只做展示，回查一律用 optionIndex）
+ */
+data class BrowseOption(
+    val optionIndex: Int,
+    @StringRes val labelRes: Int
+)
+
+/**
+ * 多维度浏览维度数据（索引化——维度名本地化后只做展示，回查一律用 dimIndex）
+ */
+data class BrowseDimension(
+    val dimIndex: Int,
+    @StringRes val labelRes: Int,
+    val options: List<BrowseOption>
+)
+
+/**
+ * 统一"发现" Tab
+ *
+ * 网络音乐多维度筛选 + 推荐歌单 + 热门推荐。
+ * 纵向排列各维度筛选行 → 操作栏（播放全部 + 换一批）→ 歌曲列表
+ */
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun DiscoverTab(
+    dimensions: List<BrowseDimension> = emptyList(),
+    filteredSongs: List<Song>,
+    isLoading: Boolean = false,
+    favoriteIds: Set<String> = emptySet(),
+    queueSongIds: Set<String> = emptySet(),
+currentDimensionValues: Map<Int, Int> = emptyMap(),
+    onDimensionChanged: (Int, Int) -> Unit = { _, _ -> },
+    onPlayAll: () -> Unit = {},
+    onShuffle: () -> Unit = {},
+    onAddAllToQueue: () -> Unit = {},
+    onPlaySong: (Song) -> Unit = {},
+    onToggleFavorite: (Song) -> Unit = {},
+    onToggleQueue: (Song) -> Unit = {},
+    onAddToPlaylist: (Song) -> Unit = {},
+    downloadStates: Map<String, DownloadState> = emptyMap(),
+    onDownloadSong: (Song) -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyGridState()
+    val firstItemFocusRequester = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+    val listBackHandler = LocalListBackHandler.current
+
+    DisposableEffect(Unit) {
+        val handler: () -> Boolean = {
+            val atTop = listState.firstVisibleItemIndex == 0 &&
+                    listState.firstVisibleItemScrollOffset == 0
+            if (!atTop) {
+                scope.launch {
+                    listState.scrollToItem(0)
+                    runCatching { firstItemFocusRequester.requestFocus() }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        listBackHandler.value = handler
+        onDispose { listBackHandler.value = null }
+    }
+
+    Column(modifier = modifier.fillMaxSize()) {
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                LoadingIndicator()
+            }
+        } else {
+            // 歌曲列表（维度行 + 操作栏 + 歌曲统一放在网格内，整体可滚动）
+            androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                columns = songGridColumns(),
+                state = listState,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+// 维度筛选行（始终显示，占满整行）
+                dimensions.forEach { dimension ->
+                    item(key = "dim_${dimension.dimIndex}", span = { GridItemSpan(maxLineSpan) }) {
+                        DimensionRow(
+                            dimension = dimension,
+                            selectedValue = currentDimensionValues[dimension.dimIndex],
+                            onSelected = { onDimensionChanged(dimension.dimIndex, it) }
+                        )
+                    }
+                }
+
+                // 有歌曲时才显示操作栏 + 歌曲列表
+                if (filteredSongs.isNotEmpty()) {
+                    // 操作栏（占满整行）
+                    item(key = "discover_actions", span = { GridItemSpan(maxLineSpan) }) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            FocusableSurface(
+                                onClick = onPlayAll,
+                                shape = RoundedCornerShape(8.dp),
+                                focusedScale = 1.08f,
+                                animationDurationMs = 150,
+                                containerColor = NasMusicColors.Primary.copy(alpha = 0.85f),
+                                focusedContainerColor = NasMusicColors.Primary,
+                                contentColor = NasMusicColors.TextPrimary,
+                                focusedContentColor = NasMusicColors.TextPrimary
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.discover_play_all),
+                                    fontSize = FontSize.button(),
+                                    color = NasMusicColors.TextPrimary,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            FocusableSurface(
+                                onClick = onAddAllToQueue,
+                                shape = RoundedCornerShape(8.dp),
+                                focusedScale = 1.08f,
+                                animationDurationMs = 150,
+                                containerColor = NasMusicColors.Surface.copy(alpha = 0.7f),
+                                focusedContainerColor = NasMusicColors.Primary.copy(alpha = 0.3f),
+                                contentColor = NasMusicColors.TextPrimary,
+                                focusedContentColor = NasMusicColors.Primary
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.discover_add_queue),
+                                    fontSize = FontSize.button(),
+                                    color = NasMusicColors.TextPrimary,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            FocusableSurface(
+                                onClick = onShuffle,
+                                shape = RoundedCornerShape(8.dp),
+                                focusedScale = 1.08f,
+                                animationDurationMs = 150,
+                                containerColor = NasMusicColors.SurfaceVariant.copy(alpha = 0.6f),
+                                focusedContainerColor = NasMusicColors.Primary.copy(alpha = 0.3f),
+                                contentColor = NasMusicColors.TextPrimary,
+                                focusedContentColor = NasMusicColors.Primary
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.discover_change_batch),
+                                    fontSize = FontSize.button(),
+                                    color = NasMusicColors.TextPrimary,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(
+                                text = stringResource(R.string.discover_song_count, filteredSongs.size),
+                                color = NasMusicColors.TextSecondary,
+                                fontSize = FontSize.body()
+                            )
+                        }
+                    }
+
+                    // 歌曲
+                    items(filteredSongs.size, key = { filteredSongs[it].id }) { index ->
+                        val song = filteredSongs[index]
+                        UnifiedSongRow(
+                            song = song,
+                            mode = SongRowMode.MODE_ROW,
+                            onClick = { onPlaySong(song) },
+                            isFavorited = song.id in favoriteIds,
+                            onToggleFavorite = { onToggleFavorite(song) },
+                            isInQueue = song.id in queueSongIds,
+                            onToggleQueue = { onToggleQueue(song) },
+                            onAddToPlaylist = { onAddToPlaylist(song) },
+                            downloadState = downloadStates.stateOfSong(song),
+                            onDownload = { onDownloadSong(song) },
+                            index = index,
+                            focusRequester = if (index == 0) firstItemFocusRequester else null
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 单个维度筛选行
+ */
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun DimensionRow(
+    dimension: BrowseDimension,
+    selectedValue: Int?,
+    onSelected: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = stringResource(dimension.labelRes),
+            color = NasMusicColors.TextSecondary,
+            fontSize = FontSize.body(),
+            modifier = Modifier.width(70.dp)
+        )
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            itemsIndexed(dimension.options) { _, option ->
+                val isSelected = option.optionIndex == selectedValue
+                val bgColor by animateColorAsState(
+                    targetValue = if (isSelected) NasMusicColors.Primary
+                    else NasMusicColors.Primary.copy(alpha = 0.2f),
+                    label = "dim_bg"
+                )
+                val textColor by animateColorAsState(
+                    targetValue = if (isSelected) Color(0xFF0C1222)
+                    else NasMusicColors.TextPrimary,
+                    label = "dim_text"
+                )
+                FocusableSurface(
+                    onClick = { onSelected(option.optionIndex) },
+                    shape = RoundedCornerShape(8.dp),
+                    focusedScale = 1.08f,
+                    animationDurationMs = 150,
+                    containerColor = bgColor,
+                    focusedContainerColor = NasMusicColors.Primary,
+                    contentColor = textColor,
+                    focusedContentColor = Color(0xFF0C1222)
+                ) {
+                    Text(
+                        text = stringResource(option.labelRes),
+                        fontSize = FontSize.body(),
+                        color = textColor,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+    }
+}
